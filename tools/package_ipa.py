@@ -1,78 +1,90 @@
 """Build the final PEAK.ipa from the CI shell IPA plus the converted game data.
 
-  python tools/package_ipa.py [--work C:/Users/v0id/peak-work] [--shell path/to/PEAK-shell.ipa] [--upload] [--serve]
+  python tools/package_ipa.py [--work C:/Users/v0id/peak-work] [--shell path/to/PEAK-shell.ipa] [--out name.ipa]
 
 Without --shell the `shell-latest` release of the PRIVATE repo is downloaded with the GitHub CLI.
-The shell's own Data files (IL2CPP metadata, "unity default resources", unity_builtin_extra, ...) stay; the game's
-scenes/assets/streaming assets come from convert_data.py's output (<work>/data/Data). The staging folder
-hardlinks the converted files (no extra disk space) and is deleted afterwards.
---upload publishes the IPA as the `ipa-latest` release of the PRIVATE repo (it contains game code + data).
---serve starts a small web server on this PC so the IPA can be downloaded with Safari over Wi-Fi.
-The IPA is derived from the game: never upload it anywhere public.
+The IPA is written entry by entry: the shell's files are copied as they are (compressed bytes, no recompression)
+except the game files it only has as placeholders (its own globalgamemanagers / level0 / sharedassets /
+unity_builtin_extra), then every converted zip of convert_data.py (<work>/conv/*.zip) is copied into the app's
+Data folder the same way. RuntimeInitializeOnLoads.json is the union of the shell's (PeakIOS hooks) and the
+retail game's, minus assemblies that are not in the build. Nothing is unpacked to the disk.
+
+The IPA is derived from the game: never upload it anywhere public (releases of the PRIVATE repo only).
 """
-import argparse, functools, http.server, json, os, shutil, socket, subprocess, sys, zipfile
+import argparse, json, os, shutil, struct, subprocess, sys, time, zipfile
 
 PRIVATE_REPO = 'm7830380-cyber/peak-ios-private'
 SHELL_ASSET = 'PEAK-shell.ipa'
 GAME_DATA = r'C:\Program Files (x86)\Steam\steamapps\common\PEAK\PEAK_Data'
-# shell files replaced by the game's (converted) ones
-SHELL_GAME_FILES = ('level', 'sharedassets', 'resources.assets', 'resources.resource', 'globalgamemanagers')
-STORE_EXT = ('.resS', '.resource', '.assets', '.bundle', '.webm')
+# shell Data files replaced by the game's (converted) ones
+SHELL_GAME_FILES = ('level', 'sharedassets', 'resources.assets', 'resources.resource', 'globalgamemanagers',
+                    'Resources/unity_builtin_extra')
 
 
-def find_app(payload):
-    for n in os.listdir(payload):
-        if n.endswith('.app'):
-            return os.path.join(payload, n)
-    raise SystemExit('no .app in shell ipa')
+def copy_raw(src, info, dst, name):
+    """Copies one entry's stored bytes from zip `src` into zip `dst` under `name` (no recompression)."""
+    src.fp.seek(info.header_offset)
+    h = src.fp.read(30)
+    if h[:4] != b'PK\x03\x04':
+        raise ValueError('bad local header for ' + info.filename)
+    n, e = struct.unpack('<HH', h[26:30])
+    src.fp.seek(info.header_offset + 30 + n + e)
+    zi = zipfile.ZipInfo(name, date_time=info.date_time)
+    zi.compress_type = info.compress_type
+    zi.CRC, zi.compress_size, zi.file_size = info.CRC, info.compress_size, info.file_size
+    zi.external_attr, zi.create_system = info.external_attr, info.create_system
+    zi.flag_bits = info.flag_bits & ~0x08            # sizes are in the header, no data descriptor
+    zi.header_offset = dst.fp.tell()
+    zip64 = zi.file_size > zipfile.ZIP64_LIMIT or zi.compress_size > zipfile.ZIP64_LIMIT
+    dst.fp.write(zi.FileHeader(zip64))
+    left = info.compress_size
+    while left:
+        chunk = src.fp.read(min(left, 1 << 22))
+        if not chunk:
+            raise IOError('truncated entry ' + info.filename)
+        dst.fp.write(chunk)
+        left -= len(chunk)
+    dst.filelist.append(zi)
+    dst.NameToInfo[zi.filename] = zi
+    dst.start_dir = dst.fp.tell()
+    dst._didModify = True
 
 
-def merge_rtiol(app_data):
-    """Union of RuntimeInitializeOnLoads.json from the retail game and the shell (which adds PeakIOS)."""
-    p_shell = os.path.join(app_data, 'RuntimeInitializeOnLoads.json')
-    shell = json.load(open(p_shell)) if os.path.exists(p_shell) else {'root': []}
+def merge_rtiol(shell_json, scripting_json):
+    """Union of RuntimeInitializeOnLoads.json from the shell (PeakIOS hooks) and the retail game, keeping only
+    assemblies the shell build contains (Unity Gaming Services, GDK, ... are left out of the iOS build)."""
+    shell = json.loads(shell_json) if shell_json else {'root': []}
+    names = set(json.loads(scripting_json)['names']) if scripting_json else None
     retail = json.load(open(os.path.join(GAME_DATA, 'RuntimeInitializeOnLoads.json')))
     key = lambda e: (e['assemblyName'], e['nameSpace'], e['className'], e['methodName'])
     seen = {key(e) for e in shell['root']}
-    added = [e for e in retail['root'] if key(e) not in seen]
-    shell['root'] += added
-    json.dump(shell, open(p_shell, 'w'))
+    added = skipped = 0
+    for e in retail['root']:
+        if key(e) in seen:
+            continue
+        if names is not None and e['assemblyName'] + '.dll' not in names:
+            skipped += 1
+            continue
+        shell['root'].append(e)
+        seen.add(key(e))
+        added += 1
     mods = [e['methodName'] for e in shell['root'] if e['assemblyName'] == 'PeakIOS']
-    print(f'RuntimeInitializeOnLoads: +{len(added)} retail entries, PeakIOS hooks: {mods}')
+    print(f'RuntimeInitializeOnLoads: +{added} retail entries ({skipped} for assemblies not in the build), PeakIOS hooks: {mods}')
     if not mods:
         raise SystemExit('the shell has no PeakIOS init hooks - mod missing from the shell build?')
-
-
-def link_or_copy(src, dst):
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if os.path.exists(dst):
-        os.remove(dst)
-    try:
-        os.link(src, dst)
-    except OSError:
-        shutil.copyfile(src, dst)
-
-
-def lan_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('10.255.255.255', 1))     # no packet is sent; picks the interface of the default route
-        return s.getsockname()[0]
-    finally:
-        s.close()
+    return json.dumps(shell)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--work', default=r'C:\Users\v0id\peak-work')
     ap.add_argument('--shell')
-    ap.add_argument('--upload', action='store_true')
-    ap.add_argument('--serve', action='store_true')
-    ap.add_argument('--port', type=int, default=8642)
+    ap.add_argument('--out', default='PEAK.ipa')
     a = ap.parse_args()
 
-    conv = os.path.join(a.work, 'data', 'Data')
-    if not os.path.exists(os.path.join(conv, 'globalgamemanagers')):
+    conv = os.path.join(a.work, 'conv')
+    zips = sorted(f for f in os.listdir(conv) if f.endswith('.zip')) if os.path.isdir(conv) else []
+    if 'globalgamemanagers.zip' not in zips or '_streams.zip' not in zips:
         sys.exit('no converted data in %s - run tools/convert_data.py first' % conv)
     shell = a.shell
     if not shell:
@@ -83,53 +95,38 @@ def main():
 
     out_dir = os.path.join(a.work, 'deliver')
     os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, 'PEAK.ipa')
-    stage = os.path.join(a.work, 'ipa_stage')
-    shutil.rmtree(stage, ignore_errors=True)
-    try:
-        with zipfile.ZipFile(shell) as z:
-            z.extractall(stage)
-        app = find_app(os.path.join(stage, 'Payload'))
-        data = os.path.join(app, 'Data')
-        print('shell app:', app)
-        for n in os.listdir(data):
-            if n.startswith(SHELL_GAME_FILES):
-                os.remove(os.path.join(data, n))
+    out = os.path.join(out_dir, a.out)
+    t0 = time.time()
+    with zipfile.ZipFile(shell) as sz, zipfile.ZipFile(out + '.tmp', 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as oz:
+        apps = sorted({i.filename.split('/')[1] for i in sz.infolist() if i.filename.startswith('Payload/') and i.filename.count('/') >= 2 and i.filename.split('/')[1].endswith('.app')})
+        if len(apps) != 1:
+            sys.exit('expected one .app in the shell, found %r' % apps)
+        data = 'Payload/%s/Data/' % apps[0]
+        print('shell app:', apps[0])
+        rtiol = sz.read(data + 'RuntimeInitializeOnLoads.json').decode() if data + 'RuntimeInitializeOnLoads.json' in sz.NameToInfo else None
+        scripting = sz.read(data + 'ScriptingAssemblies.json').decode() if data + 'ScriptingAssemblies.json' in sz.NameToInfo else None
+        provided = set()               # Data-relative names the converted zips bring (they win over the shell's)
+        for f in zips:
+            with zipfile.ZipFile(os.path.join(conv, f)) as cz:
+                provided.update(cz.namelist())
+        dropped = 0
+        for info in sz.infolist():
+            rel = info.filename[len(data):] if info.filename.startswith(data) else None
+            if rel is not None and (rel.startswith(SHELL_GAME_FILES) or rel == 'RuntimeInitializeOnLoads.json' or rel in provided):
+                dropped += 1
+                continue
+            copy_raw(sz, info, oz, info.filename)
+        oz.writestr(zipfile.ZipInfo(data + 'RuntimeInitializeOnLoads.json', date_time=time.localtime()[:6]), merge_rtiol(rtiol, scripting))
+        print(f'shell: {len(sz.infolist()) - dropped} files copied, {dropped} placeholder game files left out')
         n = 0
-        for root, _, files in os.walk(conv):
-            for f in files:
-                src = os.path.join(root, f)
-                link_or_copy(src, os.path.join(data, os.path.relpath(src, conv)))
-                n += 1
-        print(f'{n} converted data files')
-        merge_rtiol(data)
-
-        if os.path.exists(out):
-            os.remove(out)
-        with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, allowZip64=True, compresslevel=6) as z:
-            for root, dirs, files in os.walk(os.path.join(stage, 'Payload')):
-                for f in files:
-                    p = os.path.join(root, f)
-                    arc = os.path.relpath(p, stage).replace('\\', '/')
-                    ct = zipfile.ZIP_STORED if f.endswith(STORE_EXT) else zipfile.ZIP_DEFLATED
-                    z.write(p, arc, compress_type=ct)
-        print('wrote', out, os.path.getsize(out) >> 20, 'MB')
-    finally:
-        shutil.rmtree(stage, ignore_errors=True)
-
-    if a.upload:
-        tag = 'ipa-latest'
-        if subprocess.call(['gh', 'release', 'view', tag, '--repo', PRIVATE_REPO], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
-            subprocess.check_call(['gh', 'release', 'create', tag, '--repo', PRIVATE_REPO, '--prerelease',
-                                   '--title', 'PEAK iOS (TrollStore)', '--notes', 'Install with TrollStore.'])
-        subprocess.check_call(['gh', 'release', 'upload', tag, out, '--clobber', '--repo', PRIVATE_REPO])
-        print('uploaded to', PRIVATE_REPO, tag)
-
-    if a.serve:
-        url = 'http://%s:%d/PEAK.ipa' % (lan_ip(), a.port)
-        print('\nOn the iPhone (same Wi-Fi), open in Safari:\n  %s\nCtrl+C to stop.' % url)
-        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=out_dir)
-        http.server.ThreadingHTTPServer(('', a.port), handler).serve_forever()
+        for f in zips:
+            with zipfile.ZipFile(os.path.join(conv, f)) as cz:
+                for info in cz.infolist():
+                    copy_raw(cz, info, oz, data + info.filename)
+                    n += 1
+        print(f'{n} converted data files from {len(zips)} zips')
+    os.replace(out + '.tmp', out)
+    print('wrote %s: %.2f GB in %.0fs' % (out, os.path.getsize(out) / 2 ** 30, time.time() - t0))
 
 
 if __name__ == '__main__':

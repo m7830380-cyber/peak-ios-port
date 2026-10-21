@@ -24,6 +24,7 @@ MAX_SIZE = 2048
 BIG = 1024
 # Unity TextureFormat ids
 RGBA_HALF, DXT1, DXT5, BC6H, BC7, BC4, BC5 = 17, 10, 12, 24, 25, 26, 27
+R8 = 63
 DXT1_CRUNCHED, DXT5_CRUNCHED = 28, 29
 CRUNCHED = {DXT1_CRUNCHED: DXT1, DXT5_CRUNCHED: DXT5}
 ASTC_LDR = {4: 48, 5: 49, 6: 50, 8: 51}
@@ -180,12 +181,87 @@ def describe(p, tt_before):
     return '%s -> %s%s' % (s, t, size)
 
 
+# GraphicsFormat ids (Texture2DArray / Texture3D use m_Format, not TextureFormat)
+GF_DXT = {96: (DXT1, True), 97: (DXT1, False), 100: (DXT5, True), 101: (DXT5, False)}
+GF_RGBA32 = {True: 4, False: 8}            # R8G8B8A8_SRGB / _UNorm
+GF_ASTC4 = {True: 129, False: 130}         # RGBA_ASTC4X4_SRGB / _UNorm
+
+
+def plan_array(kind, tt):
+    return GF_DXT.get(tt.get('m_Format')) if kind in ('Texture2DArray', 'Texture3D') else None
+
+
+def transcode_array(kind, tt, data):
+    """Texture2DArray: every slice (element-major, each with its mip chain) DXT -> ASTC 4x4.
+    Texture3D (mip-major, each mip = depth slices): DXT -> RGBA32 (Metal has no compressed 3D textures here);
+    a 256^3 volume loses its top mip (128^3). Returns the new bytes; tt is updated."""
+    fmt, srgb = GF_DXT[tt['m_Format']]
+    w0, h0, mips = tt['m_Width'], tt['m_Height'], max(1, tt.get('m_MipCount', 1))
+    depth = tt['m_Depth']
+    out = bytearray()
+    if kind == 'Texture2DArray':
+        ctx = _context(ae.ASTCProfile.LDR_SRGB if srgb else ae.ASTCProfile.LDR, 4)
+        swz = ae.ASTCSwizzle.from_str('RGBA')
+        sizes = _mips(w0, h0, mips)
+        per = sum(_src_mip_bytes(fmt, mw, mh) for mw, mh in sizes)
+        if len(data) < per * depth:
+            raise ValueError('%s: %d bytes < %d x %d' % (tt.get('m_Name'), len(data), depth, per))
+        pos = 0
+        for _ in range(depth):
+            for mw, mh in sizes:
+                n = _src_mip_bytes(fmt, mw, mh)
+                img, typ = _decode(fmt, data[pos:pos + n], mw, mh)
+                out += ctx.compress(ae.ASTCImage(typ, mw, mh, 1, np.ascontiguousarray(img).tobytes()), swz)
+                pos += n
+        tt['m_Format'] = GF_ASTC4[srgb]
+    else:
+        levels = []
+        w, h, d = w0, h0, depth
+        for _ in range(mips):
+            levels.append((w, h, d))
+            w, h, d = max(1, w >> 1), max(1, h >> 1), max(1, d >> 1)
+        drop = 1 if max(w0, h0, depth) > 128 and mips > 1 else 0
+        pos = 0
+        for i, (w, h, d) in enumerate(levels):
+            n = _src_mip_bytes(fmt, w, h)
+            for z in range(d):
+                if i >= drop:
+                    img, _ = _decode(fmt, data[pos:pos + n], w, h)
+                    out += np.ascontiguousarray(img).tobytes()
+                pos += n
+        if pos > len(data):
+            raise ValueError('%s: %d bytes < %d' % (tt.get('m_Name'), len(data), pos))
+        w, h, d = levels[drop]
+        tt['m_Width'], tt['m_Height'], tt['m_Depth'], tt['m_MipCount'] = w, h, d, mips - drop
+        tt['m_Format'] = GF_RGBA32[srgb]
+    tt['m_DataSize'] = len(out)
+    return bytes(out)
+
+
+def keep_raw(tt):
+    """CPU-read BC6H / BC4 textures (readable, one mip: PEAK's light volume slices, decoded by the game with
+    GetPixels) keep their bytes; they are relabelled R8 with the same byte count, a format iOS loads untouched,
+    and PeakShim.Lightmap decodes them natively. Returns True when tt was relabelled."""
+    fmt = tt.get('m_TextureFormat')
+    if fmt not in (BC6H, BC4) or not tt.get('m_IsReadable') or max(1, tt.get('m_MipCount', 1)) != 1:
+        return False
+    if tt.get('m_ImageCount', 1) not in (0, 1):
+        return False
+    bw, bh = (tt['m_Width'] + 3) // 4, (tt['m_Height'] + 3) // 4
+    bpb = BLOCK_BYTES[fmt]
+    tt['m_TextureFormat'] = R8
+    tt['m_Width'], tt['m_Height'] = bw * bpb, bh
+    tt['m_CompleteImageSize'] = bw * bh * bpb
+    return True
+
+
 def transcode_file(sf, src_data_dir, dst_data_dir, report):
     """Transcode every texture of the serialized file sf and write its rebuilt .resS file(s) to dst_data_dir.
     Objects whose stream data moved get their m_StreamData updated (saved into sf, which the caller writes)."""
     texlog = report.setdefault('texture_changes', {})
     errors = report.setdefault('texture_errors', [])
     streams = {}       # resS name -> [(old offset, size, obj, tt)]
+    n_raw = [0]
     new_data = {}      # path_id -> new bytes (moved into the stream)
     for obj in sf.objects.values():
         if obj.type.name not in TEXTURE_CLASSES and obj.type.name not in ('Mesh', 'Texture3D', 'Texture2DArray', 'CubemapArray'):
@@ -194,7 +270,31 @@ def transcode_file(sf, src_data_dir, dst_data_dir, report):
         sd = tt.get('m_StreamData')
         if sd and sd.get('size'):
             streams.setdefault(sd['path'], []).append((sd['offset'], sd['size'], obj, tt))
+        if plan_array(obj.type.name, tt):
+            try:
+                if sd and sd.get('size'):
+                    with open(os.path.join(src_data_dir, sd['path']), 'rb') as f:
+                        f.seek(sd['offset'])
+                        data = f.read(sd['size'])
+                else:
+                    data = bytes(tt['image data'])
+                before = (tt['m_Width'], tt['m_Height'], tt['m_Depth'], tt['m_Format'])
+                out = transcode_array(obj.type.name, tt, data)
+                texlog[tt.get('m_Name', str(obj.path_id))] = '%s %s -> GraphicsFormat %d %dx%dx%d' % (obj.type.name, before, tt['m_Format'], tt['m_Width'], tt['m_Height'], tt['m_Depth'])
+                if sd and sd.get('size'):
+                    new_data[obj.path_id] = out
+                else:
+                    tt['image data'] = out
+                    obj.save_typetree(tt)
+            except Exception as e:
+                errors.append('%s: %r' % (tt.get('m_Name'), e))
+            continue
         if obj.type.name not in TEXTURE_CLASSES:
+            continue
+        if keep_raw(tt):
+            obj.save_typetree(tt)
+            texlog[tt.get('m_Name') or str(obj.path_id)] = 'kept raw for the CPU decoder'
+            n_raw[0] += 1
             continue
         p = plan(tt)
         if not p:
@@ -238,4 +338,5 @@ def transcode_file(sf, src_data_dir, dst_data_dir, report):
                 fo.write(blob)
                 obj.save_typetree(tt)
         report.setdefault('rebuilt_streams', []).append(path)
+    report['textures_kept_raw'] = n_raw[0]
     return n

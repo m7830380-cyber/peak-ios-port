@@ -140,6 +140,7 @@ static partial class Program
             if (an == "Photon3Unity3D") n += Step("netguard", PatchPhotonConnect(ctx));
             if (an == "Unity.ResourceManager") n += Step("bundlecrc", PatchBundleCrc(ctx));
             if (an == "User") n += Step("eos", PatchUser(ctx));
+            if (an == "LightVolume.Runtime") n += Step("lightmap", PatchLightmap(ctx));
             if (an == "Zorro.Core.Runtime") n += Step("scan", LimitAssemblyScan(ctx, "Zorro.Core.ReflectionUtility"));
             n += Step("pinvoke", RetargetPInvokes(ctx));
             n += Step("process", RedirectProcess(ctx));
@@ -587,6 +588,40 @@ static partial class Program
         }
         if (n == 0) c.Fail("no NoSteam checks found");
         return n;
+    }
+
+    // Peak.CompressableLightMap.Decompress (LightVolume.Runtime): the baked light volume's BC6H / BC4 slices cannot be
+    // read with GetPixels on iOS (and the game then logs an error per voxel). The body becomes
+    //   DestroyLastLightMap(); var g = gridRes; Uncompressed = PeakShim.Lightmap.Decompress(rgbMapSlices, alphaChannelSlices, g.x, g.y, g.z);
+    static int PatchLightmap(Ctx c)
+    {
+        var t = c.Mod.GetType("Peak.CompressableLightMap");
+        var dec = Method(c, t, "Decompress", 0);
+        var destroy = Method(c, t, "DestroyLastLightMap", 0);
+        var getGrid = Method(c, t, "get_gridRes", 0);
+        var setUnc = Method(c, t, "set_Uncompressed", 1);
+        var rgb = Field(c, t, "rgbMapSlices");
+        var alpha = Field(c, t, "alphaChannelSlices");
+        if (dec == null || destroy == null || getGrid == null || setUnc == null || rgb == null || alpha == null) return 0;
+        var int3 = getGrid.ReturnType;
+        var int3Def = int3.Resolve();
+        FieldReference F(string n) => c.Mod.ImportReference(int3Def.Fields.First(f => f.Name == n));
+        dec.Body = new MethodBody(dec) { InitLocals = true };
+        var g = new VariableDefinition(int3);
+        dec.Body.Variables.Add(g);
+        var il = dec.Body.GetILProcessor();
+        il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Call, destroy);
+        il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Call, getGrid); il.Emit(OpCodes.Stloc, g);
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldfld, rgb);
+        il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldfld, alpha);
+        il.Emit(OpCodes.Ldloca, g); il.Emit(OpCodes.Ldfld, F("x"));
+        il.Emit(OpCodes.Ldloca, g); il.Emit(OpCodes.Ldfld, F("y"));
+        il.Emit(OpCodes.Ldloca, g); il.Emit(OpCodes.Ldfld, F("z"));
+        il.Emit(OpCodes.Call, c.ShimMethod("Lightmap", "Decompress", "UnityEngine.Texture2D[]", "UnityEngine.Texture2D[]", "System.Int32", "System.Int32", "System.Int32"));
+        il.Emit(OpCodes.Call, setUnc);
+        il.Emit(OpCodes.Ret);
+        return 1;
     }
 
     // UserManager (User.dll): no Epic Online Services login. The local user is "ios-local" and there are no

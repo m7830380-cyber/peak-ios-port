@@ -36,7 +36,7 @@ DEFAULT_GAME = r'C:\Program Files (x86)\Steam\steamapps\common\PEAK'
 DEFAULT_WORK = r'C:\Users\v0id\peak-work'
 DATA_DIR = 'PEAK_Data'
 BUNDLE = 'data.unity3d'
-CONVERTER_VERSION = 'peak-1'   # bump to reconvert everything (and invalidate the shader cache)
+CONVERTER_VERSION = 'peak-2'   # bump to reconvert everything (and invalidate the shader cache)
 STREAMS_ZIP = '_streams.zip'
 
 

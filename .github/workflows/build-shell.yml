@@ -88,8 +88,10 @@ jobs:
 
       - name: Check Unity
         run: |
-          ls /Applications/Unity/Unity.app/Contents/PlaybackEngines
           file /Applications/Unity/Unity.app/Contents/MacOS/Unity
+          # the iOS module's place differs between Unity versions (inside Unity.app or next to it)
+          find /Applications/Unity -maxdepth 4 -type d -name 'iOSSupport' | head -n 3
+          find /Applications/Unity -maxdepth 4 -type d -name 'iOSSupport' | grep -q . || { echo "iOS support module not found"; exit 1; }
 
       # The .ulf is bound to the machine it was made on, so activate this runner with the serial inside it
       # (what game-ci does on macOS) and return the seat afterwards.

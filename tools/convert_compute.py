@@ -43,7 +43,8 @@ def dx_params(v, u):
 
 
 def res(name, bind, samp=-1, dim=-1):
-    return dict(name=name, generatedName='', bindPoint=bind, samplerBindPoint=samp, texDimension=dim)
+    # resType: Unity 6.3 field (0 for every resource of the retail DX11 kernels)
+    return dict(name=name, generatedName='', bindPoint=bind, samplerBindPoint=samp, texDimension=dim, resType=0)
 
 
 def metal_resources(refl, P, dxcbs):

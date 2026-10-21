@@ -1,55 +1,56 @@
 """Convert the retail PEAK (Windows) data so the iOS player can load it.
 
-  python tools/convert_data.py [--game "C:/Program Files (x86)/Steam/steamapps/common/PEAK"] [--work C:/Users/v0id/peak-work] [--only level1,...]
+  python tools/convert_data.py [--game "C:/Program Files (x86)/Steam/steamapps/common/PEAK"] [--work C:/Users/v0id/peak-work]
+                               [--only level5,globalgamemanagers.assets] [--jobs 2] [--force]
 
-Produces <work>/data/Data/ - the files tools/package_ipa.py puts into the app's Data folder
-(StreamingAssets go to Data/Raw, which is Application.streamingAssetsPath on iOS).
-For every serialized player file (globalgamemanagers, levels, sharedassets, resources):
+PEAK ships its player data as one big bundle (PEAK_Data/data.unity3d, 4.5 GB unpacked) plus the audio streams
+next to it (resources.resource, sharedassetsN.resource). The C: drive cannot hold the unpacked data, so every
+serialized file is handled on its own: its node (and its .resS stream) is extracted from the bundle into a temp
+folder, converted, and written into its own deflated zip <work>/conv/<name>.zip (entries relative to the app's
+Data folder); the temp files are deleted right away. tools/package_ipa.py builds the IPA from those zips.
+A file whose zip is already there (same converter version) is skipped, so a run can be resumed.
+
+For every serialized player file (globalgamemanagers, levels, sharedassets, resources, unity_builtin_extra):
   * the target-platform tag changes from StandaloneWindows64 (19) to iOS (9);
   * every Shader gets its DX11 programs translated to Metal (convert_shader.py);
   * every ComputeShader gets its D3D11 kernels translated to Metal (convert_compute.py);
   * BCn textures become ASTC, BC6H / half-float lightmaps ASTC HDR, 4096 maps 2048 (transcode_tex.py);
   * .resS streams that hold re-encoded textures are rebuilt, all others are copied unchanged.
-Addressables bundles (StreamingAssets/aa, the localization tables / images): same conversion, iOS tag, LZ4.
-The binary catalog is copied unchanged (its paths are already joined with "/" at load time); the
-patched Unity.ResourceManager ignores the bundle CRCs the converted bundles no longer match.
-Resources/ is not produced: the iOS player brings its own "unity default resources" and unity_builtin_extra.
+The audio .resource streams and StreamingAssets (Data/Raw on iOS) are stored unchanged (_streams.zip).
 
 Everything produced here is derived from the game: never commit or upload it anywhere public.
 """
-import argparse, hashlib, json, os, pickle, re, shutil, subprocess, sys, time, traceback
+import argparse, hashlib, json, os, pickle, re, shutil, sys, time, traceback, zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import UnityPy
 from convert_shader import convert_shader as convert_one
 from convert_compute import convert_compute
-import transcode_tex as tex
 from transcode_tex import transcode_file
+from unityfs import UnityFS
 
-UnityPy.config.FALLBACK_UNITY_VERSION = '6000.0.67f1'
+UnityPy.config.FALLBACK_UNITY_VERSION = '6000.3.15f1'
 IOS_PLATFORM = 9
 DEFAULT_GAME = r'C:\Program Files (x86)\Steam\steamapps\common\PEAK'
 DEFAULT_WORK = r'C:\Users\v0id\peak-work'
 DATA_DIR = 'PEAK_Data'
-CONVERTER_VERSION = 'peak-1'   # bump to invalidate the shader cache
+BUNDLE = 'data.unity3d'
+CONVERTER_VERSION = 'peak-1'   # bump to reconvert everything (and invalidate the shader cache)
+STREAMS_ZIP = '_streams.zip'
 
 
 def log(*a):
     print(time.strftime('%H:%M:%S'), *a, flush=True)
 
 
-def player_files(data):
-    """globalgamemanagers(.assets), levelN, resources.assets, sharedassetsN.assets - whatever the game ships."""
-    out = []
-    for f in os.listdir(data):
-        p = os.path.join(data, f)
-        if not os.path.isfile(p):
-            continue
-        if f in ('globalgamemanagers', 'globalgamemanagers.assets', 'resources.assets') or re.fullmatch(r'level\d+', f) \
-                or re.fullmatch(r'sharedassets\d+\.assets', f):
-            out.append(f)
-    return out
+def serialized_nodes(bundle):
+    """Bundle nodes that are serialized files (not .resS / .resource streams)."""
+    return [n for n in bundle.order if not n.endswith(('.resS', '.resource'))]
+
+
+def zip_name(node):
+    return node.replace('/', '_') + '.zip'
 
 
 def cache_key(kind, name, blob):
@@ -111,196 +112,137 @@ def convert_shaders_in(sf, cache_dir, work_dir, report):
     return n
 
 
-def streams_of(src):
-    """Stream files that belong to a player file: <file>.resS and, for x.assets, x.resource."""
-    out = []
-    for p in (src + '.resS', os.path.splitext(src)[0] + '.resource', src + '.resource'):
-        if os.path.exists(p) and p not in out:
-            out.append(p)
-    return out
-
-
-def process_player_file(name, data, out_data, cache_dir, work_dir):
+def convert_node(game, node, conv_dir, cache_dir, work_dir):
+    """Extract one serialized file (+ its .resS) from the bundle, convert it, write <conv_dir>/<node>.zip."""
     t0 = time.time()
     report = {}
-    src = os.path.join(data, name)
-    env = UnityPy.load(src)
-    sf = list(env.files.values())[0]
-    report['shaders_converted'] = convert_shaders_in(sf, cache_dir, work_dir, report)
-    report['textures_converted'] = transcode_file(sf, data, out_data, report)
-    sf._m_target_platform = IOS_PLATFORM
-    dst = os.path.join(out_data, name)
-    with open(dst + '.tmp', 'wb') as f:
-        f.write(sf.save())
-    os.replace(dst + '.tmp', dst)
-    rebuilt = set(report.get('rebuilt_streams', []))
-    for s in streams_of(src):
-        rel = os.path.relpath(s, data)
-        if rel not in rebuilt:
-            shutil.copyfile(s, os.path.join(out_data, rel))
+    bundle = UnityFS(os.path.join(game, DATA_DIR, BUNDLE))
+    tmp = os.path.join(work_dir, 'node_' + node.replace('/', '_'))
+    src_dir, dst_dir = os.path.join(tmp, 'src'), os.path.join(tmp, 'dst')
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(os.path.join(src_dir, os.path.dirname(node)), exist_ok=True)
+    os.makedirs(os.path.join(dst_dir, os.path.dirname(node)), exist_ok=True)
+    try:
+        bundle.extract(node, os.path.join(src_dir, node))
+        streams = [s for s in (node + '.resS',) if s in bundle.nodes]
+        for s in streams:
+            bundle.extract(s, os.path.join(src_dir, s))
+        bundle.close()
+
+        env = UnityPy.load(os.path.join(src_dir, node))
+        sf = list(env.files.values())[0]
+        report['shaders_converted'] = convert_shaders_in(sf, cache_dir, work_dir, report)
+        report['textures_converted'] = transcode_file(sf, src_dir, dst_dir, report)
+        sf._m_target_platform = IOS_PLATFORM
+        with open(os.path.join(dst_dir, node), 'wb') as f:
+            f.write(sf.save())
+        del env, sf
+        rebuilt = set(report.get('rebuilt_streams', []))
+
+        out = os.path.join(conv_dir, zip_name(node))
+        with zipfile.ZipFile(out + '.tmp', 'w', zipfile.ZIP_DEFLATED, allowZip64=True, compresslevel=6) as z:
+            z.write(os.path.join(dst_dir, node), node)
+            for s in streams:
+                z.write(os.path.join(dst_dir if s in rebuilt else src_dir, s), s)
+        os.replace(out + '.tmp', out)
+        report['bytes_in'] = sum(os.path.getsize(os.path.join(src_dir, x)) for x in [node] + streams)
+        report['bytes_zip'] = os.path.getsize(out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     report['seconds'] = round(time.time() - t0)
     return report
 
 
-def bundle_texture_bytes(bf, tt):
-    """Stored image bytes of a texture in a bundle: inline, or in the bundle's own CAB-....resS."""
-    sd = tt.get('m_StreamData')
-    if not sd or not sd.get('size'):
-        return bytes(tt['image data'])
-    stream = sd['path'].split('/')[-1]               # archive:/CAB-x/CAB-x.resS
-    f = bf.files.get(stream)
-    if f is None:
-        raise ValueError('stream %s not in bundle (%s)' % (stream, list(bf.files)))
-    buf = f.bytes if hasattr(f, 'bytes') else f.read_bytes(f.Length)
-    return bytes(buf[sd['offset']:sd['offset'] + sd['size']])
-
-
-def process_bundle(src, dst, cache_dir, work_dir):
-    """Addressables bundle: shaders + textures converted (texture data moved inline), iOS tag, LZ4."""
-    report = {}
-    env = UnityPy.load(src)
-    bf = list(env.files.values())[0]
-    for name, sf in bf.files.items():
-        if not hasattr(sf, 'objects'):
-            continue
-        report['shaders'] = report.get('shaders', 0) + convert_shaders_in(sf, cache_dir, work_dir, report)
-        for obj in sf.objects.values():
-            if obj.type.name not in tex.TEXTURE_CLASSES:
-                continue
-            tt = obj.read_typetree()
-            p = tex.plan(tt)
-            if not p:
-                continue
-            try:
-                raw = bundle_texture_bytes(bf, tt)
-                before = (tt['m_Width'], tt['m_Height'])
-                out = tex.transcode(tt, raw, p)
-                tt['image data'] = out
-                if tt.get('m_StreamData'):
-                    tt['m_StreamData'] = dict(offset=0, size=0, path='')
-                obj.save_typetree(tt)
-                report.setdefault('texture_changes', {})[tt.get('m_Name', '')] = tex.describe(p, before)
-            except Exception as e:
-                report.setdefault('texture_errors', []).append('%s: %r' % (tt.get('m_Name'), e))
-        sf._m_target_platform = IOS_PLATFORM
-    data = bf.save(packer='lz4')
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    with open(dst + '.tmp', 'wb') as f:
-        f.write(data)
-    os.replace(dst + '.tmp', dst)
-    return report
-
-
-def job(kind, *args):
+def job(*args):
     try:
         import convert_shader
         convert_shader.INLINE_SEEN.clear()
-        rep = (process_player_file if kind == 'player' else process_bundle)(*args)
+        rep = convert_node(*args)
         rep['inline_samplers'] = {str(k): v for k, v in convert_shader.INLINE_SEEN.items()}
         return rep
     except Exception:
         return {'error': traceback.format_exc()}
 
 
-def fix_catalog(raw):
-    """settings.json says iOS. catalog.bin stays byte-identical: it is a binary buffer (offsets, lengths, hashes)
-    and its internal ids are joined with '/' at load time, so editing bytes in it corrupts it."""
-    st = os.path.join(raw, 'aa', 'settings.json')
-    if os.path.exists(st):
-        s = json.load(open(st, encoding='utf8'))
-        s['m_buildTarget'] = 'iOS'
-        json.dump(s, open(st, 'w', encoding='utf8'), separators=(',', ':'))
-
-
-def tree_size(p):
-    return sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(p) for f in fs)
-
-
-def webm_to_mp4(src, dst):
-    """The iOS video player cannot play WebM (the bundled lost footage): re-encode to H.264 + AAC MP4."""
-    ff = shutil.which('ffmpeg')
-    if not ff:
-        raise SystemExit('ffmpeg is needed to convert %s (iOS cannot play WebM)' % src)
-    subprocess.run([ff, '-v', 'error', '-y', '-i', src, '-c:v', 'libx264', '-preset', 'slow', '-crf', '20',
-                    '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', dst], check=True)
-    log('converted', os.path.basename(src), '->', os.path.basename(dst))
+def write_streams_zip(game, conv_dir):
+    """Audio streams (*.resource next to data.unity3d) and StreamingAssets (-> Data/Raw), stored as they are."""
+    data = os.path.join(game, DATA_DIR)
+    out = os.path.join(conv_dir, STREAMS_ZIP)
+    with zipfile.ZipFile(out + '.tmp', 'w', zipfile.ZIP_STORED, allowZip64=True) as z:
+        for f in sorted(os.listdir(data)):
+            if f.endswith('.resource'):
+                z.write(os.path.join(data, f), f)
+        sa = os.path.join(data, 'StreamingAssets')
+        for root, _, fs in os.walk(sa):
+            for f in fs:
+                p = os.path.join(root, f)
+                z.write(p, 'Raw/' + os.path.relpath(p, sa).replace('\\', '/'), compress_type=zipfile.ZIP_DEFLATED)
+    os.replace(out + '.tmp', out)
+    return os.path.getsize(out)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--game', default=DEFAULT_GAME)
     ap.add_argument('--work', default=DEFAULT_WORK)
-    ap.add_argument('--only', default=None, help='comma separated player file / bundle names (testing)')
-    ap.add_argument('--jobs', type=int, default=2)
+    ap.add_argument('--only', default=None, help='comma separated node names (testing)')
+    ap.add_argument('--jobs', type=int, default=2, help='parallel conversions (each needs up to ~2 GB of RAM)')
+    ap.add_argument('--force', action='store_true', help='reconvert files that already have a zip')
     a = ap.parse_args()
 
-    data = os.path.join(a.game, DATA_DIR)
-    out_data = os.path.join(a.work, 'data', 'Data')
-    raw = os.path.join(out_data, 'Raw')
+    conv_dir = os.path.join(a.work, 'conv')
     cache_dir = os.path.join(a.work, 'cache', 'shaders')
     work_dir = os.path.join(a.work, 'tmp')
-    os.makedirs(cache_dir, exist_ok=True)
-    os.makedirs(out_data, exist_ok=True)
+    for d in (conv_dir, cache_dir, work_dir):
+        os.makedirs(d, exist_ok=True)
+    stamp = os.path.join(conv_dir, 'VERSION')
+    if os.path.exists(stamp) and open(stamp).read().strip() != CONVERTER_VERSION:
+        log('converter version changed: reconverting everything')
+        for f in os.listdir(conv_dir):
+            if f.endswith('.zip'):
+                os.remove(os.path.join(conv_dir, f))
+    open(stamp, 'w').write(CONVERTER_VERSION)
+
+    bundle = UnityFS(os.path.join(a.game, DATA_DIR, BUNDLE))
+    if bundle.unity_version != UnityPy.config.FALLBACK_UNITY_VERSION:
+        log('WARNING: bundle is Unity', bundle.unity_version)
     only = set(a.only.split(',')) if a.only else None
+    nodes = [n for n in serialized_nodes(bundle) if not only or n in only]
+    if not a.force:
+        nodes = [n for n in nodes if not os.path.exists(os.path.join(conv_dir, zip_name(n)))]
+    # biggest first, so the long ones overlap with the many small ones
+    sizes = {n: bundle.size(n) + (bundle.size(n + '.resS') if n + '.resS' in bundle.nodes else 0) for n in nodes}
+    nodes.sort(key=lambda n: -sizes[n])
+    bundle.close()
 
-    files = [f for f in player_files(data) if not only or f in only]
-    files.sort(key=lambda f: -sum(os.path.getsize(s) for s in [os.path.join(data, f)] + streams_of(os.path.join(data, f))))
+    if not only and (a.force or not os.path.exists(os.path.join(conv_dir, STREAMS_ZIP))):
+        log('audio streams + StreamingAssets: %d MB' % (write_streams_zip(a.game, conv_dir) >> 20))
 
-    # StreamingAssets: bundles are converted below, everything else is copied
-    sa = os.path.join(data, 'StreamingAssets')
-    bundles = []
-    if not only:
-        shutil.rmtree(raw, ignore_errors=True)
-    for root, _, fs in os.walk(sa):
-        for f in fs:
-            src = os.path.join(root, f)
-            rel = os.path.relpath(src, sa)
-            if f.endswith('.bundle'):
-                if not only or f in only:
-                    bundles.append((src, os.path.join(raw, rel)))
-            elif not only:
-                os.makedirs(os.path.dirname(os.path.join(raw, rel)), exist_ok=True)
-                if f.endswith('.webm'):
-                    webm_to_mp4(src, os.path.join(raw, rel[:-5] + '.mp4'))
-                else:
-                    shutil.copyfile(src, os.path.join(raw, rel))
-    if not only:
-        fix_catalog(raw)
-
-    log('converting %d player files and %d bundles with %d jobs' % (len(files), len(bundles), a.jobs))
+    log('converting %d serialized files (%.2f GB unpacked) with %d jobs' % (len(nodes), sum(sizes.values()) / 2 ** 30, a.jobs))
     rp = os.path.join(a.work, 'convert_report.json')
-    report = json.load(open(rp)) if (only and os.path.exists(rp)) else {}
+    report = json.load(open(rp)) if os.path.exists(rp) else {}
     t0 = time.time()
     ok = True
     with ProcessPoolExecutor(max_workers=a.jobs) as ex:
-        futs = {ex.submit(job, 'player', f, data, out_data, cache_dir, work_dir): f for f in files}
-        futs.update({ex.submit(job, 'bundle', s, d, cache_dir, work_dir): os.path.basename(s) for s, d in bundles})
+        futs = {ex.submit(job, a.game, n, conv_dir, cache_dir, work_dir): n for n in nodes}
         for fu in as_completed(futs):
-            f = futs[fu]
+            n = futs[fu]
             rep = fu.result()
-            report[f] = rep
+            report[n] = rep
             if rep.get('error'):
                 ok = False
-                log('FAILED', f, rep['error'])
-                continue
-            sh = dict(rep.get('shaders', {}) if isinstance(rep.get('shaders'), dict) else {}, **rep.get('compute_shaders', {}))
-            bad = sorted(n for n, s in sh.items() if s.get('fail'))
-            if 'seconds' in rep:
-                log('done %-28s %4ds  shaders %3d (with failures: %d)  textures %4d (errors %d)' % (
-                    f, rep['seconds'], rep['shaders_converted'], len(bad), rep['textures_converted'],
-                    len(rep.get('texture_errors', []))))
-            elif rep.get('texture_changes') or rep.get('texture_errors'):
-                log('done bundle %s: textures %d (errors %d)' % (f, len(rep.get('texture_changes', {})), len(rep.get('texture_errors', []))))
+                log('FAILED', n, rep['error'])
+            else:
+                sh = dict(rep.get('shaders', {}), **rep.get('compute_shaders', {}))
+                bad = sorted(k for k, s in sh.items() if s.get('fail'))
+                log('done %-30s %4ds  %4d MB -> %4d MB zip  shaders %3d (with failures: %d)  textures %4d (errors %d)' % (
+                    n, rep['seconds'], rep['bytes_in'] >> 20, rep['bytes_zip'] >> 20, rep['shaders_converted'], len(bad),
+                    rep['textures_converted'], len(rep.get('texture_errors', []))))
             json.dump(report, open(rp, 'w'), indent=1)
-    json.dump(report, open(rp, 'w'), indent=1)
-    seen = {}
-    for r in report.values():
-        for k, v in r.get('inline_samplers', {}).items():
-            seen[k] = seen.get(k, 0) + v
-    log('inline sampler flags seen (flags: uses):', seen)
     shutil.rmtree(work_dir, ignore_errors=True)
+    total = sum(os.path.getsize(os.path.join(conv_dir, f)) for f in os.listdir(conv_dir) if f.endswith('.zip'))
     errors = sum(len(r.get('texture_errors', [])) + ('error' in r) for r in report.values())
-    log('finished in %.0fs, data is %.2f GB, %d problems (see %s)' % (time.time() - t0, tree_size(out_data) / 2 ** 30, errors, rp))
+    log('finished in %.0fs, converted zips total %.2f GB, %d problems (see %s)' % (time.time() - t0, total / 2 ** 30, errors, rp))
     sys.exit(0 if ok and errors == 0 else 1)
 
 

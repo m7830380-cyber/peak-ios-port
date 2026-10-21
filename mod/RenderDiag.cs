@@ -292,6 +292,13 @@ namespace PeakIOS
             yield return Step("sun x4", () => { foreach (var l in FindObjectsByType<Light>(FindObjectsSortMode.None)) if (l.type == LightType.Directional && l.isActiveAndEnabled) { lightWas[l] = l.intensity; l.intensity *= 4f; } },
                 () => { foreach (var kv in lightWas) if (kv.Key) kv.Key.intensity = kv.Value; });
 
+            var batchWas = new Dictionary<UniversalRenderPipelineAsset, bool>();
+            yield return Step("SRP Batcher off", () => { foreach (var a in Assets()) { batchWas[a] = a.useSRPBatcher; a.useSRPBatcher = false; } },
+                () => { foreach (var kv in batchWas) kv.Key.useSRPBatcher = kv.Value; });
+            var aaWas = new Dictionary<UniversalAdditionalCameraData, AntialiasingMode>();
+            yield return Step("camera anti-aliasing off", () => { foreach (var c in cams) { var d = c ? c.GetUniversalAdditionalCameraData() : null; if (d != null) { aaWas[d] = d.antialiasing; d.antialiasing = AntialiasingMode.None; } } },
+                () => { foreach (var kv in aaWas) if (kv.Key) kv.Key.antialiasing = kv.Value; });
+
             foreach (var ud in UniversalDatas())
             {
                 var prim = ud.depthPrimingMode; var copy = ud.copyDepthMode; var mode = ud.renderingMode; var nrp = ud.useNativeRenderPass;

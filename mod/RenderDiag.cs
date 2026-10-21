@@ -261,6 +261,24 @@ namespace PeakIOS
             float lb = Shader.GetGlobalFloat("_Brightness");
             yield return Step("_Brightness x4", () => Shader.SetGlobalFloat("_Brightness", Mathf.Max(lb, 0.25f) * 4f), () => Shader.SetGlobalFloat("_Brightness", lb));
 
+            var depthWas = new Dictionary<UniversalRenderPipelineAsset, bool>();
+            var camDepthWas = new Dictionary<UniversalAdditionalCameraData, CameraOverrideOption>();
+            yield return Step("depth texture off", () =>
+            {
+                foreach (var a in Assets()) { depthWas[a] = a.supportsCameraDepthTexture; a.supportsCameraDepthTexture = false; }
+                foreach (var c in cams) { var d = c ? c.GetUniversalAdditionalCameraData() : null; if (d != null) { camDepthWas[d] = d.requiresDepthOption; d.requiresDepthOption = CameraOverrideOption.Off; } }
+            }, () =>
+            {
+                foreach (var kv in depthWas) kv.Key.supportsCameraDepthTexture = kv.Value;
+                foreach (var kv in camDepthWas) if (kv.Key) kv.Key.requiresDepthOption = kv.Value;
+            });
+            var opaqueWas = new Dictionary<UniversalRenderPipelineAsset, bool>();
+            yield return Step("opaque texture off", () => { foreach (var a in Assets()) { opaqueWas[a] = a.supportsCameraOpaqueTexture; a.supportsCameraOpaqueTexture = false; } },
+                () => { foreach (var kv in opaqueWas) kv.Key.supportsCameraOpaqueTexture = kv.Value; });
+            var lightWas = new Dictionary<Light, float>();
+            yield return Step("sun x4", () => { foreach (var l in FindObjectsByType<Light>(FindObjectsSortMode.None)) if (l.type == LightType.Directional && l.isActiveAndEnabled) { lightWas[l] = l.intensity; l.intensity *= 4f; } },
+                () => { foreach (var kv in lightWas) if (kv.Key) kv.Key.intensity = kv.Value; });
+
             var scaleWas = new Dictionary<UniversalRenderPipelineAsset, float>();
             yield return Step("resolution 100%", () => { foreach (var a in Assets()) { scaleWas[a] = a.renderScale; a.renderScale = 1f; } },
                 () => { foreach (var kv in scaleWas) kv.Key.renderScale = kv.Value; });

@@ -65,6 +65,15 @@ namespace PeakIOS
                 if (QualitySettings.GetRenderPipelineAssetAt(i) is UniversalRenderPipelineAsset q && seen.Add(q)) yield return q;
         }
 
+        static List<UniversalRendererData> UniversalDatas()
+        {
+            var all = new List<UniversalRendererData>();
+            foreach (var a in Assets())
+                foreach (var rd in a.rendererDataList)
+                    if (rd is UniversalRendererData u && !all.Contains(u)) all.Add(u);
+            return all;
+        }
+
         static List<ScriptableRendererFeature> AllFeatures()
         {
             var seen = new HashSet<ScriptableRendererFeature>();
@@ -142,6 +151,10 @@ namespace PeakIOS
                         var rd = list[i];
                         if (rd == null) continue;
                         sb.Append($"\n    renderer {i} '{rd.name}' ({rd.GetType().Name}):");
+                        if (rd is UniversalRendererData ud)
+                            sb.Append($" mode={ud.renderingMode} depthPriming={ud.depthPrimingMode} copyDepth={ud.copyDepthMode} " +
+                                      $"depthFmt={ud.depthAttachmentFormat}/{ud.depthTextureFormat} nativeRP={ud.useNativeRenderPass} " +
+                                      $"opaqueMask=0x{ud.opaqueLayerMask.value:X} transMask=0x{ud.transparentLayerMask.value:X} intermediate={ud.intermediateTextureMode}");
                         foreach (var f in rd.rendererFeatures)
                             if (f != null) sb.Append($" [{f.name}:{f.GetType().Name}{(f.isActive ? "" : " OFF")}]");
                     }
@@ -279,6 +292,20 @@ namespace PeakIOS
             yield return Step("sun x4", () => { foreach (var l in FindObjectsByType<Light>(FindObjectsSortMode.None)) if (l.type == LightType.Directional && l.isActiveAndEnabled) { lightWas[l] = l.intensity; l.intensity *= 4f; } },
                 () => { foreach (var kv in lightWas) if (kv.Key) kv.Key.intensity = kv.Value; });
 
+            foreach (var ud in UniversalDatas())
+            {
+                var prim = ud.depthPrimingMode; var copy = ud.copyDepthMode; var mode = ud.renderingMode; var nrp = ud.useNativeRenderPass;
+                if (prim != DepthPrimingMode.Disabled)
+                    yield return Step($"'{ud.name}' depth priming off", () => ud.depthPrimingMode = DepthPrimingMode.Disabled, () => ud.depthPrimingMode = prim);
+                else if (GraphicsSetup.GameDepthPriming.TryGetValue(ud, out var game))
+                    yield return Step($"'{ud.name}' depth priming {game} (game's)", () => ud.depthPrimingMode = game, () => ud.depthPrimingMode = prim);
+                if (mode != RenderingMode.Forward)
+                    yield return Step($"'{ud.name}' Forward (was {mode})", () => ud.renderingMode = RenderingMode.Forward, () => ud.renderingMode = mode);
+                yield return Step($"'{ud.name}' native render pass {(nrp ? "off" : "on")}", () => ud.useNativeRenderPass = !nrp, () => ud.useNativeRenderPass = nrp);
+                yield return Step($"'{ud.name}' copy depth {(copy == CopyDepthMode.AfterOpaques ? "after transparents" : "after opaques")}",
+                    () => ud.copyDepthMode = copy == CopyDepthMode.AfterOpaques ? CopyDepthMode.AfterTransparents : CopyDepthMode.AfterOpaques, () => ud.copyDepthMode = copy);
+            }
+
             var scaleWas = new Dictionary<UniversalRenderPipelineAsset, float>();
             yield return Step("resolution 100%", () => { foreach (var a in Assets()) { scaleWas[a] = a.renderScale; a.renderScale = 1f; } },
                 () => { foreach (var kv in scaleWas) kv.Key.renderScale = kv.Value; });
@@ -286,6 +313,24 @@ namespace PeakIOS
             var main = Camera.main;
             if (main != null)
             {
+                foreach (var shName in new[] { "Universal Render Pipeline/Unlit", "Sprites/Default", "W/Peak_Standard" })
+                {
+                    var sh = Shader.Find(shName);
+                    if (sh == null) { results.Append($"\n  pink box '{shName}': shader not found"); continue; }
+                    GameObject box = null;
+                    yield return Step($"pink box '{shName}'", () =>
+                    {
+                        box = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                        Destroy(box.GetComponent<Collider>());
+                        box.layer = 0;
+                        var t = main.transform;
+                        box.transform.SetPositionAndRotation(t.position + t.forward * 1.5f, t.rotation);
+                        box.transform.localScale = new Vector3(1.2f, 0.8f, 0.2f);
+                        var m = new Material(sh);
+                        foreach (var prop in new[] { "_BaseColor", "_Color", "_Tint" }) if (m.HasProperty(prop)) m.SetColor(prop, new Color(1f, 0f, 1f, 1f));
+                        box.GetComponent<Renderer>().sharedMaterial = m;
+                    }, () => { if (box) Destroy(box); });
+                }
                 var clearWas = main.clearFlags; var bgWas = main.backgroundColor; int maskWas = main.cullingMask;
                 yield return Step("camera: grey, draws nothing", () => { main.clearFlags = CameraClearFlags.SolidColor; main.backgroundColor = new Color(0.5f, 0.5f, 0.5f, 1f); main.cullingMask = 0; },
                     () => { main.clearFlags = clearWas; main.backgroundColor = bgWas; main.cullingMask = maskWas; });

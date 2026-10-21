@@ -15,6 +15,11 @@ namespace PeakIOS
     /// </summary>
     public static class GraphicsSetup
     {
+        /// Depth priming (a depth-only pre-pass, then opaque objects drawn only where their depth is exactly equal)
+        /// is turned off: on the phone no opaque object passed that test and only the sky was drawn. It is a
+        /// desktop optimisation that Apple GPUs do not need (they remove hidden surfaces in hardware).
+        public static readonly Dictionary<UniversalRendererData, DepthPrimingMode> GameDepthPriming = new Dictionary<UniversalRendererData, DepthPrimingMode>();
+
         public static void Configure()
         {
             var seen = new HashSet<RenderPipelineAsset>();
@@ -28,6 +33,13 @@ namespace PeakIOS
                         var before = u.gpuResidentDrawerMode;
                         if (before != GPUResidentDrawerMode.Disabled) u.gpuResidentDrawerMode = GPUResidentDrawerMode.Disabled;
                         Log.Info($"URP asset '{u.name}' ({where}): GPU Resident Drawer {before} -> {u.gpuResidentDrawerMode}, SRP Batcher {u.useSRPBatcher}");
+                        foreach (var rd in u.rendererDataList)
+                            if (rd is UniversalRendererData ud && ud.depthPrimingMode != DepthPrimingMode.Disabled)
+                            {
+                                GameDepthPriming[ud] = ud.depthPrimingMode;
+                                ud.depthPrimingMode = DepthPrimingMode.Disabled;
+                                Log.Info($"renderer '{ud.name}': depth priming {GameDepthPriming[ud]} -> Disabled");
+                            }
                     }
                     catch (Exception e) { Log.Warn($"URP asset '{u.name}': {e.Message}"); }
                 }

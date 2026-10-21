@@ -88,7 +88,9 @@ jobs:
 
       - name: Check Unity
         run: |
-          file /Applications/Unity/Unity.app/Contents/MacOS/Unity
+          UNITY_BIN="$(ls -d /Applications/Unity/Unity.app /Applications/Unity/*/Unity.app 2>/dev/null | head -n 1)/Contents/MacOS/Unity"
+          file "$UNITY_BIN"
+          [ -x "$UNITY_BIN" ] || { echo "Unity editor not found"; exit 1; }
           # the iOS module's place differs between Unity versions (inside Unity.app or next to it)
           find /Applications/Unity -maxdepth 4 -type d -name 'iOSSupport' | head -n 3
           find /Applications/Unity -maxdepth 4 -type d -name 'iOSSupport' | grep -q . || { echo "iOS support module not found"; exit 1; }
@@ -146,7 +148,7 @@ jobs:
           UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
-          [ -x /Applications/Unity/Unity.app/Contents/MacOS/Unity ] || exit 0
+          ls -d /Applications/Unity/Unity.app /Applications/Unity/*/Unity.app >/dev/null 2>&1 || exit 0
           ci/unity.sh /tmp/return.log 150 "" -quit -returnlicense -username "$UNITY_EMAIL" -password "$UNITY_PASSWORD" || true
 
       # Linked assemblies of a failed IL2CPP run go to the PRIVATE repo only (they contain game code).

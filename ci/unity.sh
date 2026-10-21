@@ -4,7 +4,8 @@
 # Returns Unity's exit code; 0 if the done regex appeared in the log (Unity is then killed if it lingers);
 # 124 on timeout. The log is followed live so the job output shows progress.
 LOG="$1"; LIMIT="$2"; DONE="$3"; shift 3
-UNITY=/Applications/Unity/Unity.app/Contents/MacOS/Unity
+# Unity 6.0 installs /Applications/Unity/Unity.app, 6.3 /Applications/Unity/Unity-<version>/Unity.app
+UNITY="$(ls -d /Applications/Unity/Unity.app /Applications/Unity/*/Unity.app 2>/dev/null | head -n 1)/Contents/MacOS/Unity"
 rm -f "$LOG"; touch "$LOG"
 "$UNITY" -batchmode -nographics -logFile "$LOG" "$@" &
 PID=$!

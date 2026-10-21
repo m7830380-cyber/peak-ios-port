@@ -63,6 +63,9 @@ namespace PeakIOS
             new ChoiceRow { Label = "Frame rate cap", Options = new[] { "30", "60", "120" }, Get = () => Array.IndexOf(s_Fps, IosSettings.FpsCap) < 0 ? 1 : Array.IndexOf(s_Fps, IosSettings.FpsCap), Set = i => IosSettings.FpsCap = s_Fps[i] },
             new SliderRow { Label = "Resolution", Min = 0.4f, Max = 1f, Get = () => IosSettings.RenderScale, Set = v => IosSettings.RenderScale = v, Fmt = v => Mathf.RoundToInt(v * 100) + "%" },
             new ChoiceRow { Label = "Microphone (voice)", Options = new[] { "Off", "On" }, Get = () => IosSettings.Microphone ? 1 : 0, Set = i => IosSettings.Microphone = i == 1 },
+            new ChoiceRow { Label = "Test: post-processing", Options = new[] { "Off", "On" }, Get = () => RenderDiag.PostFx ? 1 : 0, Set = i => RenderDiag.PostFx = i == 1 },
+            new ChoiceRow { Label = "Test: screen effects", Options = new[] { "Off", "On" }, Get = () => RenderDiag.Features ? 1 : 0, Set = i => RenderDiag.Features = i == 1 },
+            new ChoiceRow { Label = "Test: HDR", Options = new[] { "Off", "On" }, Get = () => RenderDiag.Hdr ? 1 : 0, Set = i => RenderDiag.Hdr = i == 1 },
         };
 
         static bool s_Dirty;
@@ -74,7 +77,7 @@ namespace PeakIOS
         {
             float h = Screen.height;
             Rect safe = Screen.safeArea;
-            float x = safe.xMin + safe.width * 0.04f, cw = safe.width * 0.92f, rowH = h * 0.1f, y = h * 0.05f;
+            float x = safe.xMin + safe.width * 0.04f, cw = safe.width * 0.92f, rowH = h * 0.075f, y = h * 0.04f;
             s_Close = new Rect(x + cw - cw * 0.18f, y, cw * 0.18f, rowH);
             y += rowH * 1.3f;
             foreach (var r in s_Rows) { r.Rect = new Rect(x, y, cw, rowH); y += rowH * 1.04f; }
@@ -161,7 +164,7 @@ namespace PeakIOS
             var last = s_Rows[s_Rows.Count - 1].Rect;
             GUI.Label(new Rect(last.x, last.yMax + h * 0.01f, last.width, h - last.yMax),
                 "Quality, shadows and effects are in the game's own Settings menu. A lower resolution or frame rate saves " +
-                "battery and heat. Log: Files > On My iPhone > PEAK > PEAK-iOS.log (or tap the FPS counter).", m_Small);
+                "battery and heat. \"Test\" switches are for tracking down picture problems (turning one Off and back On may need a restart). Log: Files > On My iPhone > PEAK > PEAK-iOS.log (or tap the FPS counter).", m_Small);
             GUI.color = Color.white;
         }
 

@@ -56,6 +56,7 @@ namespace PeakIOS
                 UnityEngine.Object.DontDestroyOnLoad(go);
                 go.AddComponent<DebugOverlay>();
                 go.AddComponent<SettingsPanel>();
+                go.AddComponent<RenderDiag>();
                 IosSettings.Init();
                 go.AddComponent<Lifecycle>();
                 if (OnDevice)

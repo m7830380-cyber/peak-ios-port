@@ -12,8 +12,8 @@ namespace PeakShim
     /// Replacement for Peak.CompressableLightMap.Decompress (the patcher sends the whole method here). The baked
     /// light volume is one BC6H (RGB) + one BC4 (alpha) texture per Z slice; the game reads them with GetPixels into
     /// a 333 MB Color[] and fills an RGBA half-float Texture3D. iOS has no BC6H, so the converter leaves the slices'
-    /// bytes as they are (labelled R8) and this decodes them natively (PeakLightmap.mm) straight into the Texture3D,
-    /// whose CPU copy is dropped once it is on the GPU.
+    /// bytes as they are (labelled R8) and this decodes them natively (PeakLightmap.mm) straight into the Texture3D.
+    /// The texture stays readable: LightVolume.SamplePosition reads it with GetPixel (voice obscurance, volume lights).
     /// </summary>
     public static class Lightmap
     {
@@ -51,7 +51,15 @@ namespace PeakShim
                     }
                     PeakLM_DecodeSlice((byte*)rb.GetUnsafeReadOnlyPtr(), ap, gx, gy, d + slice * i);
                 }
-                tex.Apply(false, true);   // to the GPU; the CPU copy is released
+                double sr = 0, sg = 0, sb = 0, sa = 0; int cnt = 0;
+                long total = slice * n / 4;
+                for (long p = 0; p < total; p += 997, cnt++)
+                {
+                    sr += Mathf.HalfToFloat(d[p * 4]); sg += Mathf.HalfToFloat(d[p * 4 + 1]);
+                    sb += Mathf.HalfToFloat(d[p * 4 + 2]); sa += Mathf.HalfToFloat(d[p * 4 + 3]);
+                }
+                if (cnt > 0) Debug.Log($"[PEAK-iOS] light volume mean rgba=({sr / cnt:0.000}, {sg / cnt:0.000}, {sb / cnt:0.000}, {sa / cnt:0.000}) over {cnt} voxels");
+                tex.Apply(false, false);   // to the GPU, keeping the CPU copy for GetPixel
             }
             catch (Exception e)
             {

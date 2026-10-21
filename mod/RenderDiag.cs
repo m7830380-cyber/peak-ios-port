@@ -110,7 +110,16 @@ namespace PeakIOS
             if (Camera.main == null) yield break;
             LogState(scene);
             if (s_Swept.Contains(scene) || s_Sweeping) yield break;
-            yield return new WaitForSecondsRealtime(6f);
+            // brightness over the first seconds, to catch a picture that shows and then goes dark
+            var seq = new StringBuilder();
+            float t0 = Time.realtimeSinceStartup;
+            while (Time.realtimeSinceStartup - t0 < 6f)
+            {
+                yield return Capture((sh, tex) => seq.Append($" {Time.realtimeSinceStartup - t0:0.0}s:{(sh.R + sh.G + sh.B) / 3f:0}"));
+                yield return new WaitForSecondsRealtime(0.4f);
+            }
+            Log.Info($"render '{scene}' brightness after load:{seq}");
+            for (int i = 0; i < 60 && LoadingScreenHandler.loading; i++) yield return new WaitForSecondsRealtime(0.5f);
             if (Camera.main == null || SceneManager.GetActiveScene().name != scene) yield break;
             s_Swept.Add(scene);
             yield return Sweep(scene);
@@ -165,6 +174,13 @@ namespace PeakIOS
             }
             catch (Exception e) { sb.Append("\n  (failed: " + e.Message + ")"); }
             Log.Info(sb.ToString());
+        }
+
+        static bool LayerHasVisible(int layer)
+        {
+            foreach (var r in FindObjectsByType<Renderer>(FindObjectsSortMode.None))
+                if (r.gameObject.layer == layer && r.enabled && r.isVisible) return true;
+            return false;
         }
 
         static string Describe(Texture t) => t == null ? "null" : $"{t.name} {t.width}x{t.height} {t.graphicsFormat}";
@@ -249,7 +265,53 @@ namespace PeakIOS
             yield return Step("resolution 100%", () => { foreach (var a in Assets()) { scaleWas[a] = a.renderScale; a.renderScale = 1f; } },
                 () => { foreach (var kv in scaleWas) kv.Key.renderScale = kv.Value; });
 
+            var main = Camera.main;
+            if (main != null)
+            {
+                var clearWas = main.clearFlags; var bgWas = main.backgroundColor; int maskWas = main.cullingMask;
+                yield return Step("camera: grey, draws nothing", () => { main.clearFlags = CameraClearFlags.SolidColor; main.backgroundColor = new Color(0.5f, 0.5f, 0.5f, 1f); main.cullingMask = 0; },
+                    () => { main.clearFlags = clearWas; main.backgroundColor = bgWas; main.cullingMask = maskWas; });
+                yield return Step("camera: grey background", () => { main.clearFlags = CameraClearFlags.SolidColor; main.backgroundColor = new Color(0.5f, 0.5f, 0.5f, 1f); },
+                    () => { main.clearFlags = clearWas; main.backgroundColor = bgWas; });
+                for (int layer = 0; layer < 32; layer++)
+                {
+                    int bit = 1 << layer;
+                    if ((maskWas & bit) == 0 || !LayerHasVisible(layer)) continue;
+                    yield return Step($"layer {layer} '{LayerMask.LayerToName(layer)}' hidden", () => main.cullingMask = maskWas & ~bit, () => main.cullingMask = maskWas);
+                }
+            }
             Log.Info($"render test '{scene}' results:{results}");
+
+            // Hide every visible renderer that uses one shader, for each shader in view: finds a material that
+            // covers the picture (a dark fog / sky / overlay) or that draws itself black.
+            var groups = new Dictionary<string, List<Renderer>>();
+            foreach (var r in FindObjectsByType<Renderer>(FindObjectsSortMode.None))
+            {
+                if (!r.enabled || !r.isVisible || r.GetType().Name == "ParticleSystemRenderer") continue;
+                foreach (var m in r.sharedMaterials)
+                {
+                    if (m == null || m.shader == null) continue;
+                    string key = m.shader.name;
+                    if (!groups.TryGetValue(key, out var lst)) groups[key] = lst = new List<Renderer>();
+                    if (!lst.Contains(r)) lst.Add(r);
+                }
+            }
+            var order = new List<KeyValuePair<string, List<Renderer>>>(groups);
+            order.Sort((a, b) => b.Value.Count.CompareTo(a.Value.Count));
+            results.Clear();
+            int shown = 0;
+            foreach (var kv in order)
+            {
+                if (shown++ >= 48) break;
+                var hidden = new List<Renderer>();
+                var sample = kv.Value[0];
+                var mat = Array.Find(sample.sharedMaterials, m => m != null && m.shader != null && m.shader.name == kv.Key);
+                string info = $"{kv.Value.Count} renderers, e.g. '{sample.name}' mat '{(mat ? mat.name : "?")}' queue {(mat ? mat.renderQueue : 0)}";
+                yield return Step($"hide '{kv.Key}'", () => { foreach (var r in kv.Value) if (r && r.enabled) { r.enabled = false; hidden.Add(r); } },
+                    () => { foreach (var r in hidden) if (r) r.enabled = true; });
+                results.Append($"  ({info})");
+            }
+            Log.Info($"render test '{scene}' shaders in view (picture with each one hidden):{results}");
             s_Sweeping = false;
             s_Reapply = true;
         }

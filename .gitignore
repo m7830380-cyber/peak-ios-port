@@ -1,0 +1,52 @@
+# local-only
+_old_attempt/
+.tools/
+build/
+work/
+*.ipa
+__pycache__/
+
+# Unity
+shell/[Ll]ibrary/
+shell/[Tt]emp/
+shell/[Ll]ogs/
+shell/[Uu]serSettings/
+shell/Build/
+shell/*.csproj
+shell/*.sln
+
+# dotnet
+[Bb]in/
+[Oo]bj/
+.vs/
+
+# patched retail assemblies come from the private repo at build time
+shell/Assets/Plugins/Game/
+
+# NOTHING from the game or from SDKs may ever be committed here (this repo is public).
+# Game-derived files and SDK binaries live only in the private repo m7830380-cyber/peak-ios-private.
+*.dll
+*.pdb
+*.a
+*.so
+*.dylib
+*.framework/
+*.bank
+*.assets
+*.resS
+*.resource
+*.bundle
+*.unitypackage
+*.zip
+*.ulf
+*.alf
+globalgamemanagers*
+level[0-9]*
+sharedassets*
+decomp*/
+d_*/
+staged-managed/
+shell/Assets/Plugins/iOS/*.a
+shell/Assets/StreamingAssets/
+*.json.game
+scratch/

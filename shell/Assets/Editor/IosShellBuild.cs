@@ -34,7 +34,7 @@ public static class IosShellBuild
         PlayerSettings.companyName = "LandCrab";
         PlayerSettings.productName = "PEAK";
         PlayerSettings.SetApplicationIdentifier(Target, "com.peak.iosport");
-        PlayerSettings.bundleVersion = "2.6.b";          // the retail version (Application.version, Photon game version)
+        PlayerSettings.bundleVersion = "2.6.0";          // Unity only accepts digits here; OnPostprocess writes the retail "2.6.b"
         PlayerSettings.iOS.buildNumber = Environment.GetEnvironmentVariable("GITHUB_RUN_NUMBER") ?? "1";
         PlayerSettings.SetScriptingBackend(Target, ScriptingImplementation.IL2CPP);
         // link.xml keeps every game assembly whole; Minimal is the least stripping IL2CPP allows.
@@ -131,6 +131,8 @@ public static class IosShellBuild
         plist.ReadFromFile(plistPath);
         var root = plist.root;
         root.SetString("CFBundleDisplayName", "PEAK");
+        // Application.version on iOS is CFBundleShortVersionString: the game builds its Photon game version from it
+        root.SetString("CFBundleShortVersionString", "2.6.b");
         root.SetBoolean("UIFileSharingEnabled", true);           // Documents visible in Files / Filza
         root.SetBoolean("LSSupportsOpeningDocumentsInPlace", true);
         root.SetBoolean("UISupportsDocumentBrowser", true);

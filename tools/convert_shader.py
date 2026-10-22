@@ -135,6 +135,8 @@ def build_metal_params(refl, msl, P, cbname_map):
         elif k == 'cbbind':
             binds.append(dict(kind='cb', name=r['name'], index=r['index'], arraySize=1))
         elif k == 'tex':
+            if r['name'].startswith('_UnityFBInput') and b'color(xlt_remap_i' in msl:
+                continue   # a fragment input on Metal (framebuffer_fetch), not a texture
             if r['uav']:
                 ou = next((u for u in P['uav'] if u['name'] == r['name']), None)
                 binds.append(dict(kind='uav', name=r['name'], index=r['index'], orig=ou['orig'] if ou else r['index']))
@@ -178,10 +180,29 @@ def vertex_channels(refl):
     return smap, ch
 
 
+FB_TEX = re.compile(rb'texture2d\w*<(float|half|int|uint), access::\w+ > _UnityFBInput(\d) \[\[ texture\(\d+\) \]\]')
+
+
 def fix_msl(msl, is_vs):
     if is_vs:
         msl = msl.replace(b'[[ position ]]', b'[[ position, invariant ]]')
+    elif FB_TEX.search(msl):
+        msl = framebuffer_fetch(msl)
     return msl
+
+
+def framebuffer_fetch(msl):
+    """DX11 emulates framebuffer fetch (FRAMEBUFFER_INPUT, used by Hidden/CoreSRP/CoreCopy) with a texture
+    _UnityFBInputN read at the pixel position. On Metal the render graph's copy pass gives that attachment to the
+    shader as a fragment input instead and binds no texture, so the copy read nothing and the full-screen effects
+    after it (fog, scary) drew one flat colour over the whole picture. Rewritten the way HLSLcc writes Unity's own
+    Metal framebuffer fetch: a [[ color(xlt_remap_i[N]) ]] parameter (MSAA: the current sample)."""
+    msl = FB_TEX.sub(lambda m: b'%s4 _UnityFBInput%s [[ color(xlt_remap_i[%s]) ]]' % (m.group(1), m.group(2), m.group(2)), msl)
+    msl = re.sub(rb'_UnityFBInput(\d)\.read\([^();]*\)', rb'_UnityFBInput\1', msl)
+    msl = re.sub(rb'_UnityFBInput(\d)\.read\(\s*return', rb'_UnityFBInput\1;\n    return', msl)   # HLSLcc's broken MS-array read
+    at = re.search(rb'\n(struct |constant |constexpr |fragment )', msl)
+    decl = b'#ifndef XLT_REMAP_I\n\t#define XLT_REMAP_I {0, 1, 2, 3, 4, 5, 6, 7}\n#endif\nconstexpr constant uint xlt_remap_i[] = XLT_REMAP_I;\n'
+    return msl[:at.start() + 1] + decl + msl[at.start() + 1:]
 
 
 # Unity inline sampler flags (sampler_LinearClamp etc.): filter in bits 0-1, wrap U/V/W in bits 2-7.

@@ -38,6 +38,7 @@ DATA_DIR = 'PEAK_Data'
 BUNDLE = 'data.unity3d'
 CONVERTER_VERSION = 'peak-2'   # bump to reconvert everything (and invalidate the shader cache)
 STREAMS_ZIP = '_streams.zip'
+FB_FETCH_REV = '#fb1'   # the only framebuffer-fetch shader: reconverted alone when its translation changes
 
 
 def log(*a):
@@ -86,7 +87,7 @@ def convert_shaders_in(sf, cache_dir, work_dir, report):
         else:
             name = tt['m_Name']
             blob = pickle.dumps(tt['variants'])
-        key = cache_key(kind, name, blob)
+        key = cache_key(kind, name + FB_FETCH_REV if name == 'Hidden/CoreSRP/CoreCopy' else name, blob)
         wd = os.path.join(work_dir, 'hlslcc', key)
         msgs = []
 

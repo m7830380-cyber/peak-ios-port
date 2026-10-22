@@ -66,6 +66,7 @@ namespace PeakIOS
             new ChoiceRow { Label = "Test: post-processing", Options = new[] { "Off", "On" }, Get = () => RenderDiag.PostFx ? 1 : 0, Set = i => RenderDiag.PostFx = i == 1 },
             new ChoiceRow { Label = "Test: screen effects", Options = new[] { "Off", "On" }, Get = () => RenderDiag.Features ? 1 : 0, Set = i => RenderDiag.Features = i == 1 },
             new ChoiceRow { Label = "Test: HDR", Options = new[] { "Off", "On" }, Get = () => RenderDiag.Hdr ? 1 : 0, Set = i => RenderDiag.Hdr = i == 1 },
+            new ChoiceRow { Label = "Test: screen copy", Options = new[] { "Blit", "Tile" }, Get = () => GraphicsSetup.FramebufferFetchCopy ? 1 : 0, Set = i => GraphicsSetup.FramebufferFetchCopy = i == 1 },
         };
 
         static bool s_Dirty;

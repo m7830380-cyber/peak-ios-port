@@ -14,9 +14,9 @@ namespace PeakIOS
     /// <summary>
     /// Rendering diagnostics. On each scene with a camera it logs the camera / URP / renderer feature / volume /
     /// fog state, then (once per scene name, a few seconds in) captures the screen with one thing changed at a
-    /// time - post-processing off, HDR off, each renderer feature off, the light volume replaced by white, full
-    /// resolution - and logs the average brightness of each capture, so a black or white picture can be traced
-    /// to the part that causes it. The first capture is saved to Documents/PEAK-shot-&lt;scene&gt;.png.
+    /// time - the full-screen effects (fog, scary) off, the render graph's framebuffer-fetch copy switched, all
+    /// renderer features off, a pink box in front of the camera, a grey background - and logs the average colour
+    /// of each capture. Captures are saved to Documents/PEAK-shot-&lt;scene&gt;[-noeffects|-fbcopy|-blitcopy].png.
     /// The same switches are in the iOS settings panel (persisted) for testing by eye.
     /// </summary>
     public sealed class RenderDiag : MonoBehaviour
@@ -189,13 +189,6 @@ namespace PeakIOS
             Log.Info(sb.ToString());
         }
 
-        static bool LayerHasVisible(int layer)
-        {
-            foreach (var r in FindObjectsByType<Renderer>(FindObjectsSortMode.None))
-                if (r.gameObject.layer == layer && r.enabled && r.isVisible) return true;
-            return false;
-        }
-
         static string Describe(Texture t) => t == null ? "null" : $"{t.name} {t.width}x{t.height} {t.graphicsFormat}";
 
         struct Shot { public float R, G, B, Dark; }
@@ -227,7 +220,7 @@ namespace PeakIOS
             s_Sweeping = true;
             Log.Info($"render test '{scene}': average screen colour (0-255) and % near-black pixels, one change at a time");
             var results = new StringBuilder();
-            IEnumerator Step(string name, Action on, Action off, bool save = false)
+            IEnumerator Step(string name, Action on, Action off, string save = null)
             {
                 bool ok = true;
                 try { on?.Invoke(); } catch (Exception e) { ok = false; results.Append($"\n  {name}: could not apply ({e.Message})"); }
@@ -235,97 +228,32 @@ namespace PeakIOS
                     yield return Capture((s, tex) =>
                     {
                         results.Append($"\n  {name,-28} rgb=({s.R:0},{s.G:0},{s.B:0}) dark={s.Dark:0}%");
-                        if (save)
-                            try { File.WriteAllBytes(Path.Combine(Paths.Documents, $"PEAK-shot-{scene}.png"), tex.EncodeToPNG()); }
+                        if (save != null)
+                            try { File.WriteAllBytes(Path.Combine(Paths.Documents, $"PEAK-shot-{scene}{save}.png"), tex.EncodeToPNG()); }
                             catch (Exception e) { Log.Warn("screenshot save failed: " + e.Message); }
                     });
                 try { off?.Invoke(); } catch (Exception e) { results.Append($"\n  {name}: could not undo ({e.Message})"); }
             }
 
             var cams = new List<Camera>(Camera.allCameras);
-            yield return Step("as is", null, null, true);
+            yield return Step("as is", null, null, "");
 
-            var postWas = new Dictionary<Camera, bool>();
-            yield return Step("post-processing off", () =>
-            {
-                foreach (var c in cams) { var d = c ? c.GetUniversalAdditionalCameraData() : null; if (d != null) { postWas[c] = d.renderPostProcessing; d.renderPostProcessing = false; } }
-            }, () => { foreach (var kv in postWas) if (kv.Key) kv.Key.GetUniversalAdditionalCameraData().renderPostProcessing = kv.Value; });
-
-            var hdrWas = new Dictionary<UniversalRenderPipelineAsset, bool>();
-            yield return Step("HDR off", () => { foreach (var a in Assets()) { hdrWas[a] = a.supportsHDR; a.supportsHDR = false; } },
-                () => { foreach (var kv in hdrWas) kv.Key.supportsHDR = kv.Value; });
-
+            var full = new List<ScriptableRendererFeature>();
+            foreach (var f in AllFeatures()) if (f.isActive && f is FullScreenPassRendererFeature) full.Add(f);
+            yield return Step("full-screen effects off", () => { foreach (var f in full) f.SetActive(false); }, () => { foreach (var f in full) f.SetActive(true); }, "-noeffects");
+            bool fb = Gfx.FramebufferFetchCopy;
+            yield return Step($"framebuffer-fetch copy {(fb ? "off" : "on")}", () => Gfx.FramebufferFetchCopy = !fb, () => Gfx.FramebufferFetchCopy = fb, fb ? "-blitcopy" : "-fbcopy");
             var feats = new List<ScriptableRendererFeature>();
             foreach (var f in AllFeatures()) if (f.isActive) feats.Add(f);
             yield return Step("all renderer features off", () => { foreach (var f in feats) f.SetActive(false); }, () => { foreach (var f in feats) f.SetActive(true); });
-            foreach (var f in feats)
-                yield return Step($"'{f.name}' off", () => f.SetActive(false), () => f.SetActive(true));
-
-            Texture lm = Shader.GetGlobalTexture("_LightMap");
-            Texture3D white = null;
-            yield return Step("light volume white", () =>
-            {
-                white = new Texture3D(1, 1, 1, TextureFormat.RGBAHalf, false);
-                white.SetPixel(0, 0, 0, Color.white);
-                white.Apply(false, true);
-                Shader.SetGlobalTexture("_LightMap", white);
-            }, () => { Shader.SetGlobalTexture("_LightMap", lm); if (white) Destroy(white); });
-
-            float lb = Shader.GetGlobalFloat("_Brightness");
-            yield return Step("_Brightness x4", () => Shader.SetGlobalFloat("_Brightness", Mathf.Max(lb, 0.25f) * 4f), () => Shader.SetGlobalFloat("_Brightness", lb));
-
-            var depthWas = new Dictionary<UniversalRenderPipelineAsset, bool>();
-            var camDepthWas = new Dictionary<UniversalAdditionalCameraData, CameraOverrideOption>();
-            yield return Step("depth texture off", () =>
-            {
-                foreach (var a in Assets()) { depthWas[a] = a.supportsCameraDepthTexture; a.supportsCameraDepthTexture = false; }
-                foreach (var c in cams) { var d = c ? c.GetUniversalAdditionalCameraData() : null; if (d != null) { camDepthWas[d] = d.requiresDepthOption; d.requiresDepthOption = CameraOverrideOption.Off; } }
-            }, () =>
-            {
-                foreach (var kv in depthWas) kv.Key.supportsCameraDepthTexture = kv.Value;
-                foreach (var kv in camDepthWas) if (kv.Key) kv.Key.requiresDepthOption = kv.Value;
-            });
-            var opaqueWas = new Dictionary<UniversalRenderPipelineAsset, bool>();
-            yield return Step("opaque texture off", () => { foreach (var a in Assets()) { opaqueWas[a] = a.supportsCameraOpaqueTexture; a.supportsCameraOpaqueTexture = false; } },
-                () => { foreach (var kv in opaqueWas) kv.Key.supportsCameraOpaqueTexture = kv.Value; });
-            var lightWas = new Dictionary<Light, float>();
-            yield return Step("sun x4", () => { foreach (var l in FindObjectsByType<Light>(FindObjectsSortMode.None)) if (l.type == LightType.Directional && l.isActiveAndEnabled) { lightWas[l] = l.intensity; l.intensity *= 4f; } },
-                () => { foreach (var kv in lightWas) if (kv.Key) kv.Key.intensity = kv.Value; });
-
-            var batchWas = new Dictionary<UniversalRenderPipelineAsset, bool>();
-            yield return Step("SRP Batcher off", () => { foreach (var a in Assets()) { batchWas[a] = a.useSRPBatcher; a.useSRPBatcher = false; } },
-                () => { foreach (var kv in batchWas) kv.Key.useSRPBatcher = kv.Value; });
-            var aaWas = new Dictionary<UniversalAdditionalCameraData, AntialiasingMode>();
-            yield return Step("camera anti-aliasing off", () => { foreach (var c in cams) { var d = c ? c.GetUniversalAdditionalCameraData() : null; if (d != null) { aaWas[d] = d.antialiasing; d.antialiasing = AntialiasingMode.None; } } },
-                () => { foreach (var kv in aaWas) if (kv.Key) kv.Key.antialiasing = kv.Value; });
-
-            foreach (var ud in UniversalDatas())
-            {
-                var prim = ud.depthPrimingMode; var copy = ud.copyDepthMode; var mode = ud.renderingMode; var nrp = ud.useNativeRenderPass;
-                if (prim != DepthPrimingMode.Disabled)
-                    yield return Step($"'{ud.name}' depth priming off", () => ud.depthPrimingMode = DepthPrimingMode.Disabled, () => ud.depthPrimingMode = prim);
-                else if (GraphicsSetup.GameDepthPriming.TryGetValue(ud, out var game))
-                    yield return Step($"'{ud.name}' depth priming {game} (game's)", () => ud.depthPrimingMode = game, () => ud.depthPrimingMode = prim);
-                if (mode != RenderingMode.Forward)
-                    yield return Step($"'{ud.name}' Forward (was {mode})", () => ud.renderingMode = RenderingMode.Forward, () => ud.renderingMode = mode);
-                yield return Step($"'{ud.name}' native render pass {(nrp ? "off" : "on")}", () => ud.useNativeRenderPass = !nrp, () => ud.useNativeRenderPass = nrp);
-                yield return Step($"'{ud.name}' copy depth {(copy == CopyDepthMode.AfterOpaques ? "after transparents" : "after opaques")}",
-                    () => ud.copyDepthMode = copy == CopyDepthMode.AfterOpaques ? CopyDepthMode.AfterTransparents : CopyDepthMode.AfterOpaques, () => ud.copyDepthMode = copy);
-            }
-
-            var scaleWas = new Dictionary<UniversalRenderPipelineAsset, float>();
-            yield return Step("resolution 100%", () => { foreach (var a in Assets()) { scaleWas[a] = a.renderScale; a.renderScale = 1f; } },
-                () => { foreach (var kv in scaleWas) kv.Key.renderScale = kv.Value; });
 
             var main = Camera.main;
             if (main != null)
             {
-                foreach (var shName in new[] { "Universal Render Pipeline/Unlit", "Sprites/Default", "W/Peak_Standard" })
-                {
-                    var sh = Shader.Find(shName);
-                    if (sh == null) { results.Append($"\n  pink box '{shName}': shader not found"); continue; }
-                    GameObject box = null;
-                    yield return Step($"pink box '{shName}'", () =>
+                var sh = Shader.Find("Universal Render Pipeline/Unlit");
+                GameObject box = null;
+                if (sh != null)
+                    yield return Step("pink box", () =>
                     {
                         box = GameObject.CreatePrimitive(PrimitiveType.Cube);
                         Destroy(box.GetComponent<Collider>());
@@ -334,54 +262,15 @@ namespace PeakIOS
                         box.transform.SetPositionAndRotation(t.position + t.forward * 1.5f, t.rotation);
                         box.transform.localScale = new Vector3(1.2f, 0.8f, 0.2f);
                         var m = new Material(sh);
-                        foreach (var prop in new[] { "_BaseColor", "_Color", "_Tint" }) if (m.HasProperty(prop)) m.SetColor(prop, new Color(1f, 0f, 1f, 1f));
+                        m.SetColor("_BaseColor", new Color(1f, 0f, 1f, 1f));
                         box.GetComponent<Renderer>().sharedMaterial = m;
                     }, () => { if (box) Destroy(box); });
-                }
-                var clearWas = main.clearFlags; var bgWas = main.backgroundColor; int maskWas = main.cullingMask;
-                yield return Step("camera: grey, draws nothing", () => { main.clearFlags = CameraClearFlags.SolidColor; main.backgroundColor = new Color(0.5f, 0.5f, 0.5f, 1f); main.cullingMask = 0; },
-                    () => { main.clearFlags = clearWas; main.backgroundColor = bgWas; main.cullingMask = maskWas; });
+                var clearWas = main.clearFlags; var bgWas = main.backgroundColor;
                 yield return Step("camera: grey background", () => { main.clearFlags = CameraClearFlags.SolidColor; main.backgroundColor = new Color(0.5f, 0.5f, 0.5f, 1f); },
                     () => { main.clearFlags = clearWas; main.backgroundColor = bgWas; });
-                for (int layer = 0; layer < 32; layer++)
-                {
-                    int bit = 1 << layer;
-                    if ((maskWas & bit) == 0 || !LayerHasVisible(layer)) continue;
-                    yield return Step($"layer {layer} '{LayerMask.LayerToName(layer)}' hidden", () => main.cullingMask = maskWas & ~bit, () => main.cullingMask = maskWas);
-                }
             }
             Log.Info($"render test '{scene}' results:{results}");
 
-            // Hide every visible renderer that uses one shader, for each shader in view: finds a material that
-            // covers the picture (a dark fog / sky / overlay) or that draws itself black.
-            var groups = new Dictionary<string, List<Renderer>>();
-            foreach (var r in FindObjectsByType<Renderer>(FindObjectsSortMode.None))
-            {
-                if (!r.enabled || !r.isVisible || r.GetType().Name == "ParticleSystemRenderer") continue;
-                foreach (var m in r.sharedMaterials)
-                {
-                    if (m == null || m.shader == null) continue;
-                    string key = m.shader.name;
-                    if (!groups.TryGetValue(key, out var lst)) groups[key] = lst = new List<Renderer>();
-                    if (!lst.Contains(r)) lst.Add(r);
-                }
-            }
-            var order = new List<KeyValuePair<string, List<Renderer>>>(groups);
-            order.Sort((a, b) => b.Value.Count.CompareTo(a.Value.Count));
-            results.Clear();
-            int shown = 0;
-            foreach (var kv in order)
-            {
-                if (shown++ >= 48) break;
-                var hidden = new List<Renderer>();
-                var sample = kv.Value[0];
-                var mat = Array.Find(sample.sharedMaterials, m => m != null && m.shader != null && m.shader.name == kv.Key);
-                string info = $"{kv.Value.Count} renderers, e.g. '{sample.name}' mat '{(mat ? mat.name : "?")}' queue {(mat ? mat.renderQueue : 0)}";
-                yield return Step($"hide '{kv.Key}'", () => { foreach (var r in kv.Value) if (r && r.enabled) { r.enabled = false; hidden.Add(r); } },
-                    () => { foreach (var r in hidden) if (r) r.enabled = true; });
-                results.Append($"  ({info})");
-            }
-            Log.Info($"render test '{scene}' shaders in view (picture with each one hidden):{results}");
             s_Sweeping = false;
             s_Reapply = true;
         }

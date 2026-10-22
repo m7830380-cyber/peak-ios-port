@@ -142,6 +142,7 @@ static partial class Program
             if (an == "User") n += Step("eos", PatchUser(ctx));
             if (an == "LightVolume.Runtime") n += Step("lightmap", PatchLightmap(ctx));
             if (an == "Zorro.Core.Runtime") n += Step("scan", LimitAssemblyScan(ctx, "Zorro.Core.ReflectionUtility"));
+            if (an == "Unity.RenderPipelines.Core.Runtime") n += Step("copypass", PatchCopyPass(ctx));
             n += Step("pinvoke", RetargetPInvokes(ctx));
             n += Step("process", RedirectProcess(ctx));
             n += Step("cursor", RedirectCursor(ctx));
@@ -621,6 +622,24 @@ static partial class Program
         il.Emit(OpCodes.Call, c.ShimMethod("Lightmap", "Decompress", "UnityEngine.Texture2D[]", "UnityEngine.Texture2D[]", "System.Int32", "System.Int32", "System.Int32"));
         il.Emit(OpCodes.Call, setUnc);
         il.Emit(OpCodes.Ret);
+        return 1;
+    }
+
+    // RenderGraphUtils.CanAddCopyPass(RenderGraph, TextureHandle, TextureHandle) (Core RP) starts with
+    //   if (!PeakShim.Gfx.AllowCopyPass()) return false;
+    // so AddBlitPass (FullScreenPassRendererFeature's colour copy) can fall back to a plain blit instead of the
+    // framebuffer-fetch copy pass.
+    static int PatchCopyPass(Ctx c)
+    {
+        var t = c.Mod.GetType("UnityEngine.Rendering.RenderGraphModule.Util.RenderGraphUtils");
+        var m = Method(c, t, "CanAddCopyPass", 3);
+        if (m == null) return 0;
+        var il = m.Body.GetILProcessor();
+        var first = m.Body.Instructions[0];
+        il.InsertBefore(first, il.Create(OpCodes.Call, c.ShimMethod("Gfx", "AllowCopyPass")));
+        il.InsertBefore(first, il.Create(OpCodes.Brtrue, first));
+        il.InsertBefore(first, il.Create(OpCodes.Ldc_I4_0));
+        il.InsertBefore(first, il.Create(OpCodes.Ret));
         return 1;
     }
 

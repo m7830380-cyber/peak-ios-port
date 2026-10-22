@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using PeakShim;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
@@ -20,8 +21,17 @@ namespace PeakIOS
         /// desktop optimisation that Apple GPUs do not need (they remove hidden surfaces in hardware).
         public static readonly Dictionary<UniversalRendererData, DepthPrimingMode> GameDepthPriming = new Dictionary<UniversalRendererData, DepthPrimingMode>();
 
+        /// The render graph's framebuffer-fetch copy pass (PeakShim.Gfx); off unless peakios_fbcopy=1.
+        public static bool FramebufferFetchCopy
+        {
+            get => Gfx.FramebufferFetchCopy;
+            set { Gfx.FramebufferFetchCopy = value; Prefs.SetInt("peakios_fbcopy", value ? 1 : 0); }
+        }
+
         public static void Configure()
         {
+            Gfx.FramebufferFetchCopy = Prefs.GetInt("peakios_fbcopy", 0) != 0;
+            Log.Info($"render graph copy pass: {(Gfx.FramebufferFetchCopy ? "framebuffer fetch" : "blit")}");
             var seen = new HashSet<RenderPipelineAsset>();
             void Fix(RenderPipelineAsset a, string where)
             {

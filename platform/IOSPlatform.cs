@@ -175,7 +175,7 @@ namespace PeakPlatform
                 m_OnDone = onDone;
                 m_Keyboard = TouchScreenKeyboard.Open(string.Empty, TouchScreenKeyboardType.Default, false,
                     dialogType == DialogType.Chat, false, false, title ?? string.Empty,
-                    dialogType == DialogType.Chat ? 200 : 20);
+                    dialogType == DialogType.Chat ? 200 : dialogType == DialogType.JoinRoom ? 6 : 20);
             }
             catch (Exception e)
             {

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using PeakShim;
 using UnityEngine;
 
 namespace PeakIOS
@@ -53,10 +54,28 @@ namespace PeakIOS
             }
         }
 
+        /// Tap to type a new value on the iOS keyboard.
+        sealed class TextRow : Row
+        {
+            public Func<string> Get; public Action<string> Set; public int Limit = 32;
+            public Rect Field => new Rect(Rect.x + Rect.width * 0.45f, Rect.y + Rect.height * 0.12f, Rect.width * 0.5f, Rect.height * 0.76f);
+            public override string Value => "";
+            public override void Touch(Vector2 gui, bool began)
+            {
+                if (!began || !Field.Contains(gui) || s_Keyboard != null) return;
+                s_Editing = this;
+                s_Keyboard = TouchScreenKeyboard.Open(Get(), TouchScreenKeyboardType.Default, false, false, false, false, Label, Limit);
+            }
+        }
+
+        static TouchScreenKeyboard s_Keyboard;
+        static TextRow s_Editing;
+
         static readonly int[] s_Fps = { 30, 60, 120 };
 
         static readonly List<Row> s_Rows = new List<Row>
         {
+            new TextRow { Label = "Your name (Wi-Fi games)", Get = () => Identity.NickName, Set = Identity.SetNickName },
             new SliderRow { Label = "Look speed", Min = 0.2f, Max = 3f, Get = () => IosSettings.LookSpeed, Set = v => IosSettings.LookSpeed = v, Fmt = v => v.ToString("0.00") },
             new SliderRow { Label = "Button size", Min = 0.6f, Max = 1.6f, Get = () => IosSettings.HudScale, Set = v => IosSettings.HudScale = v, Fmt = v => Mathf.RoundToInt(v * 100) + "%" },
             new SliderRow { Label = "Button opacity", Min = 0.1f, Max = 1f, Get = () => IosSettings.HudOpacity, Set = v => IosSettings.HudOpacity = v, Fmt = v => Mathf.RoundToInt(v * 100) + "%" },
@@ -78,7 +97,7 @@ namespace PeakIOS
         {
             float h = Screen.height;
             Rect safe = Screen.safeArea;
-            float x = safe.xMin + safe.width * 0.04f, cw = safe.width * 0.92f, rowH = h * 0.075f, y = h * 0.04f;
+            float x = safe.xMin + safe.width * 0.04f, cw = safe.width * 0.92f, rowH = h * 0.066f, y = h * 0.03f;
             s_Close = new Rect(x + cw - cw * 0.18f, y, cw * 0.18f, rowH);
             y += rowH * 1.3f;
             foreach (var r in s_Rows) { r.Rect = new Rect(x, y, cw, rowH); y += rowH * 1.04f; }
@@ -116,6 +135,21 @@ namespace PeakIOS
             IosSettings.Apply();
         }
 
+        void Update()
+        {
+            if (s_Keyboard == null) return;
+            var st = s_Keyboard.status;
+            if (st == TouchScreenKeyboard.Status.Visible) return;
+            if (st == TouchScreenKeyboard.Status.Done)
+            {
+                string text = s_Keyboard.text;
+                try { s_Editing?.Set(text); Log.Info($"{s_Editing?.Label}: '{text}'"); }
+                catch (Exception e) { Log.Warn("settings text: " + e.Message); }
+            }
+            s_Keyboard = null;
+            s_Editing = null;
+        }
+
         void OnGUI()
         {
             if (!Open || Event.current.type != EventType.Repaint) return;
@@ -150,6 +184,12 @@ namespace PeakIOS
                     Fill(new Rect(t.x, t.center.y - 3, t.width * f, 6), new Color(0.3f, 0.6f, 1f, 1f));
                     float k = t.height * 0.5f;
                     Fill(new Rect(t.x + t.width * f - k / 2, t.center.y - k / 2, k, k), Color.white);
+                }
+                else if (r is TextRow tr)
+                {
+                    var f = tr.Field;
+                    Fill(f, new Color(1, 1, 1, 0.15f));
+                    GUI.Label(f, tr.Get(), m_Center);
                 }
                 else if (r is ChoiceRow c)
                 {

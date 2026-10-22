@@ -59,6 +59,7 @@ namespace PeakIOS
                 go.AddComponent<RenderDiag>();
                 IosSettings.Init();
                 go.AddComponent<Lifecycle>();
+                Lan.LanSession.Init(go);
                 if (OnDevice)
                 {
                     VInput.Virtual = true;

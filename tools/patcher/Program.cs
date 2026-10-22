@@ -28,6 +28,7 @@
 //  * CloudAPI version check / lobby verification (azurewebsites) are off; the daily island comes from the
 //    game's offline fallback (by date).
 //  * NetworkingUtilities.ConnectToNetwork uses Photon's offline mode unless a Wi-Fi session is set up.
+//  * PLAY / JOIN (room code) start local Wi-Fi games through PeakShim.Lan instead of Steam lobbies / Photon Cloud.
 // Zorro.Core.Runtime ReflectionUtility: attribute scans only walk the game's assemblies (PeakShim.GameAssemblies),
 //    keeping the first scene load inside the iOS launch watchdog.
 // Unity.Burst: Burst is reported disabled, so [BurstCompile] code runs as managed (IL2CPP) code.
@@ -557,6 +558,80 @@ static partial class Program
             }
             if (k == 0) c.Fail("GetMovementInput: no ret");
             n += k;
+        }
+
+        n += PatchLanHooks(c);
+        return n;
+    }
+
+    // Local (same Wi-Fi) multiplayer, driven by PeakShim.Lan (filled in by PeakIOS.Lan.LanSession):
+    //  * MainMenuMainPage.StartMultiplayerLobby (PLAY): if (PeakShim.Lan.BeforeHost()) return;  (no Steam lobby: the
+    //    in-app server starts, Photon goes online against it and the airport loads as host)
+    //  * MainMenuMainPage.JoinClicked: PhotonNetwork.OfflineMode -> PeakShim.Lan.MenuOffline(OfflineMode)  (the menu is
+    //    offline until a Wi-Fi game starts; the join page must still open)
+    //  * MainMenuJoinRoomPage.JoinRoom(string): if (PeakShim.Lan.BeforeJoin(room)) return;  (no cloud region swap:
+    //    Photon is pointed at the host the code names)
+    //  * NetworkConnector.HandleConnectionState: the hosted room's name (= the code players type) comes from
+    //    PeakShim.Lan.RoomName(Utilities.CreateRandomName(...))
+    static int PatchLanHooks(Ctx c)
+    {
+        int n = 0;
+        var page = c.Mod.GetType("MainMenuMainPage");
+        var host = Method(c, page, "StartMultiplayerLobby", 0);
+        if (host != null)
+        {
+            var il = host.Body.GetILProcessor();
+            var first = host.Body.Instructions[0];
+            il.InsertBefore(first, il.Create(OpCodes.Call, c.ShimMethod("Lan", "BeforeHost")));
+            il.InsertBefore(first, il.Create(OpCodes.Brfalse, first));
+            il.InsertBefore(first, il.Create(OpCodes.Ret));
+            n++;
+        }
+
+        var joinClicked = Method(c, page, "JoinClicked", 0);
+        if (joinClicked != null)
+        {
+            var offline = joinClicked.Body.Instructions.Where(i => i.OpCode == OpCodes.Call && i.Operand is MethodReference r &&
+                r.Name == "get_OfflineMode" && r.DeclaringType.Name == "PhotonNetwork").ToList();
+            if (offline.Count != 1) c.Fail($"JoinClicked: expected 1 PhotonNetwork.OfflineMode read, found {offline.Count}");
+            else
+            {
+                var il = joinClicked.Body.GetILProcessor();
+                il.InsertAfter(offline[0], il.Create(OpCodes.Call, c.ShimMethod("Lan", "MenuOffline", "System.Boolean")));
+                n++;
+            }
+        }
+
+        var join = Method(c, c.Mod.GetType("MainMenuJoinRoomPage"), "JoinRoom", 1);
+        if (join != null)
+        {
+            var il = join.Body.GetILProcessor();
+            var first = join.Body.Instructions[0];
+            il.InsertBefore(first, il.Create(OpCodes.Ldarg_1));
+            il.InsertBefore(first, il.Create(OpCodes.Call, c.ShimMethod("Lan", "BeforeJoin", "System.String")));
+            il.InsertBefore(first, il.Create(OpCodes.Brfalse, first));
+            il.InsertBefore(first, il.Create(OpCodes.Ret));
+            n++;
+        }
+
+        var handle = Method(c, c.Mod.GetType("NetworkConnector"), "HandleConnectionState", 1);
+        if (handle != null)
+        {
+            var make = handle.Body.Instructions.Where(i => i.OpCode == OpCodes.Call && i.Operand is MethodReference r &&
+                r.Name == "CreateRandomName" && r.DeclaringType.Name == "Utilities").ToList();
+            if (make.Count != 1) c.Fail($"HandleConnectionState: expected 1 Utilities.CreateRandomName call, found {make.Count}");
+            else
+            {
+                var il = handle.Body.GetILProcessor();
+                il.InsertAfter(make[0], il.Create(OpCodes.Call, c.ShimMethod("Lan", "RoomName", "System.String")));
+                n++;
+            }
+        }
+        // inserted code may push short branches out of range
+        foreach (var m in new[] { host, joinClicked, join, handle }.Where(m => m != null))
+        {
+            m.Body.SimplifyMacros();
+            m.Body.OptimizeMacros();
         }
         return n;
     }

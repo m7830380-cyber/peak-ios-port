@@ -85,6 +85,7 @@ namespace PeakIOS
             new ChoiceRow { Label = "Test: post-processing", Options = new[] { "Off", "On" }, Get = () => RenderDiag.PostFx ? 1 : 0, Set = i => RenderDiag.PostFx = i == 1 },
             new ChoiceRow { Label = "Test: screen effects", Options = new[] { "Off", "On" }, Get = () => RenderDiag.Features ? 1 : 0, Set = i => RenderDiag.Features = i == 1 },
             new ChoiceRow { Label = "Test: HDR", Options = new[] { "Off", "On" }, Get = () => RenderDiag.Hdr ? 1 : 0, Set = i => RenderDiag.Hdr = i == 1 },
+            new ChoiceRow { Label = "Test: auto picture test", Options = new[] { "Off", "On" }, Get = () => RenderDiag.AutoSweep ? 1 : 0, Set = i => RenderDiag.AutoSweep = i == 1 },
             new ChoiceRow { Label = "Test: screen copy", Options = new[] { "Blit", "Tile" }, Get = () => GraphicsSetup.FramebufferFetchCopy ? 1 : 0, Set = i => GraphicsSetup.FramebufferFetchCopy = i == 1 },
         };
 
@@ -97,7 +98,7 @@ namespace PeakIOS
         {
             float h = Screen.height;
             Rect safe = Screen.safeArea;
-            float x = safe.xMin + safe.width * 0.04f, cw = safe.width * 0.92f, rowH = h * 0.066f, y = h * 0.03f;
+            float x = safe.xMin + safe.width * 0.04f, cw = safe.width * 0.92f, rowH = h * 0.06f, y = h * 0.025f;
             s_Close = new Rect(x + cw - cw * 0.18f, y, cw * 0.18f, rowH);
             y += rowH * 1.3f;
             foreach (var r in s_Rows) { r.Rect = new Rect(x, y, cw, rowH); y += rowH * 1.04f; }
@@ -156,7 +157,7 @@ namespace PeakIOS
             GUI.depth = -200;
             Layout();
             float h = Screen.height, w = Screen.width;
-            int fs = Mathf.RoundToInt(h * 0.035f);
+            int fs = Mathf.RoundToInt(h * 0.03f);
             if (m_Title == null)
             {
                 m_Title = new GUIStyle(GUI.skin.label) { fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleLeft };

@@ -23,6 +23,9 @@ namespace PeakIOS
     {
         public static bool PostFx { get => Prefs.GetInt("peakios_diag_postfx", 1) != 0; set { Prefs.SetInt("peakios_diag_postfx", value ? 1 : 0); s_Reapply = true; } }
         public static bool Features { get => Prefs.GetInt("peakios_diag_features", 1) != 0; set { Prefs.SetInt("peakios_diag_features", value ? 1 : 0); s_Reapply = true; } }
+        /// The automatic per-scene test (brightness timeline + switch sweep with screenshots): off since the
+        /// picture works (build 6); it flashes the screen and stalls the GPU with read-backs.
+        public static bool AutoSweep { get => Prefs.GetInt("peakios_diag_sweep", 0) != 0; set => Prefs.SetInt("peakios_diag_sweep", value ? 1 : 0); }
         public static bool Hdr { get => Prefs.GetInt("peakios_diag_hdr", 1) != 0; set { Prefs.SetInt("peakios_diag_hdr", value ? 1 : 0); s_Reapply = true; } }
 
         static bool s_Reapply = true;
@@ -118,7 +121,7 @@ namespace PeakIOS
             for (int i = 0; i < 20; i++) yield return null;
             if (Camera.main == null) yield break;
             LogState(scene);
-            if (s_Swept.Contains(scene) || s_Sweeping) yield break;
+            if (!AutoSweep || s_Swept.Contains(scene) || s_Sweeping) yield break;
             // brightness over the first seconds, to catch a picture that shows and then goes dark
             var seq = new StringBuilder();
             float t0 = Time.realtimeSinceStartup;
